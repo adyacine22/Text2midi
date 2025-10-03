@@ -18,10 +18,10 @@ training:
     learning_rate: 0.000001
     weight_decay: 0.01
     gradient_accumulation_steps: 4
-    with_tracking: True
+    with_tracking: False  # Set to True if using wandb
     checkpointing_steps: epoch
     report_to: wandb
-    output_dir: /root/output_test_new
+    output_dir: ./output  # Changed to relative path
     per_device_train_batch_size: 32
     use_scheduler: True
     lr_scheduler_type: cosine #choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
@@ -34,29 +34,29 @@ training:
     k: -0.312
 
 raw_data:
-  caption_dataset_path: /root/captions/train.json
+  caption_dataset_path: ./captions/captions.json  # Changed to relative path
   raw_data_folders: 
     lmd: 
-      folder_path: /import/c4dm-datasets-ext/lakhmidi
+      folder_path: ./data/lakhmidi  # Changed to relative path (optional, only if you have this data)
       file_extension: midi
     symphonynet:
-      folder_path: /root/text2midi/data/symphonynet/data/SymphonyNet_Dataset
+      folder_path: ./data/symphonynet  # Changed to relative path
       file_extension: mid
     maestro:
-      folder_path: /import/c4dm-datasets/maestro-v3.0.0
+      folder_path: ./data/maestro-v3.0.0  # Changed to relative path
       file_extension: midi
     pop909:
-      folder_path: /import/c4dm-datasets-ext/POP909
+      folder_path: ./data/POP909  # Changed to relative path
       file_extension: mid
     pijama:
-      folder_path: /import/c4dm-datasets/PiJAMA/data/midi
+      folder_path: ./data/PiJAMA  # Changed to relative path
       file_extension: midi
     midicaps:
-      folder_path: /root/data
+      folder_path: ./data/midicaps  # Changed to relative path
       file_extension: mid
     
 
 deepspeed_config:
-  deepspeed_config_path: /root/test/text2midi/configs/ds_config.json
+  deepspeed_config_path: ./configs/ds_config.json  # Changed to relative path
 
-artifact_folder: ../artifacts
+artifact_folder: ./artifacts

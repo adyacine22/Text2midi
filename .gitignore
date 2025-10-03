@@ -29,6 +29,7 @@ MANIFEST
 soundfont/
 generated_midi/
 wav/
+data/
 pytorch_model.bin
 
 # PyInstaller

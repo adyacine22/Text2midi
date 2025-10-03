@@ -13,6 +13,7 @@ import os
 import warnings
 from tqdm import tqdm
 from torch import Tensor
+
 # from aria.tokenizer import AbsTokenizer
 import pickle
 from torch.nn import Module, LayerNorm, Dropout, Linear
@@ -40,6 +41,7 @@ import torch.profiler
 from accelerate import Accelerator
 import argparse  # Add this import
 
+
 class CaptionDataset(Dataset):
     def __init__(self, captions):
         self.captions = captions
@@ -50,40 +52,47 @@ class CaptionDataset(Dataset):
     def __getitem__(self, idx):
         return self.captions[idx]
 
+
 def custom_collate_fn(batch):
-    captions = [item['caption'] for item in batch]
-    locations = [item['location'] for item in batch]
+    captions = [item["caption"] for item in batch]
+    locations = [item["location"] for item in batch]
     return captions, locations
+
 
 def ensure_log_dir_exists(log_dir):
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
-__all__ = ['Transformer', 'TransformerEncoder', 'TransformerDecoder', 'TransformerEncoderLayer', 'TransformerDecoderLayer']
+
+__all__ = [
+    "Transformer",
+    "TransformerEncoder",
+    "TransformerDecoder",
+    "TransformerEncoderLayer",
+    "TransformerDecoderLayer",
+]
+
 
 def _generate_square_subsequent_mask(
-        sz: int,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
+    sz: int,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     r"""Generate a square causal mask for the sequence.
 
     The masked positions are filled with float('-inf'). Unmasked positions are filled with float(0.0).
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
     if dtype is None:
         dtype = torch.float32
     return torch.triu(
-        torch.full((sz, sz), float('-inf'), dtype=dtype, device=device),
+        torch.full((sz, sz), float("-inf"), dtype=dtype, device=device),
         diagonal=1,
     )
 
 
-def _get_seq_len(
-        src: Tensor,
-        batch_first: bool
-) -> Optional[int]:
+def _get_seq_len(src: Tensor, batch_first: bool) -> Optional[int]:
 
     if src.is_nested:
         return None
@@ -120,12 +129,14 @@ class PositionalEncoding(nn.Module):
 
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0).transpose(0, 1)
         # self.register_buffer('pe', pe)
-        self.register_parameter('pe', nn.Parameter(pe, requires_grad=False))
+        self.register_parameter("pe", nn.Parameter(pe, requires_grad=False))
 
     def forward(self, x):
         r"""Inputs of forward function
@@ -137,7 +148,7 @@ class PositionalEncoding(nn.Module):
         Examples:
             >>> output = pos_encoder(x)
         """
-        x = x + self.pe[:x.size(0), :]
+        x = x + self.pe[: x.size(0), :]
         return self.dropout(x)
 
 
@@ -178,7 +189,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x2_new = x2.mul(cos) + tmp.mul(sin)
     x = torch.cat((x1_new, x2_new), dim=-1)
     x = x.permute(0, 2, 1, 3)
-    
+
     return x
 
 
@@ -211,12 +222,12 @@ class MultiHeadSelfAttention(nn.Module):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
-        factory_kwargs = {'device': device, 'dtype': dtype}
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.embed_dim = embed_dim
         self.batch_first = batch_first
         self.dim_head = embed_dim // num_heads
-        self.scale = self.dim_head ** -0.5
+        self.scale = self.dim_head**-0.5
         self.heads = num_heads
         hidden_dim = self.dim_head * num_heads
         self.to_qkv = nn.Linear(embed_dim, hidden_dim * 3, bias=False, **factory_kwargs)
@@ -224,7 +235,6 @@ class MultiHeadSelfAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
-        
         r"""Forward pass of the multi-head self-attention module.
 
         Args:
@@ -241,15 +251,17 @@ class MultiHeadSelfAttention(nn.Module):
         q, k, v = map(lambda t: t.contiguous().view(b, self.heads, n, -1), (q, k, v))
 
         self.freqs_cis = precompute_freqs_cis(
-                seq_len=n,
-                n_elem=self.embed_dim // self.heads,
-                base=10000,
-                dtype=x.dtype,
-            ).to(x.device)
+            seq_len=n,
+            n_elem=self.embed_dim // self.heads,
+            base=10000,
+            dtype=x.dtype,
+        ).to(x.device)
         freqs_cis = self.freqs_cis[: x.shape[1]]
         # q = apply_rotary_emb(q, freqs_cis)
         # k = apply_rotary_emb(k, freqs_cis)
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=is_causal
+        )
         out = out.contiguous().view(b, n, -1)
         out = self.dropout(out)
         return self.to_out(out)
@@ -294,13 +306,26 @@ class Transformer(Module):
     https://github.com/pytorch/examples/tree/master/word_language_model
     """
 
-    def __init__(self, n_vocab: int = 30000, d_model: int = 512, nhead: int = 8, max_len: int = 5000,
-                 num_decoder_layers: int = 6, dim_feedforward: int = 2048, use_moe: bool = False, 
-                 num_experts: int = 16, dropout: float = 0.1, 
-                 activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
-                 layer_norm_eps: float = 1e-5, batch_first: bool = True, norm_first: bool = False,
-                 bias: bool = True, device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    def __init__(
+        self,
+        n_vocab: int = 30000,
+        d_model: int = 512,
+        nhead: int = 8,
+        max_len: int = 5000,
+        num_decoder_layers: int = 6,
+        dim_feedforward: int = 2048,
+        use_moe: bool = False,
+        num_experts: int = 16,
+        dropout: float = 0.1,
+        activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
+        layer_norm_eps: float = 1e-5,
+        batch_first: bool = True,
+        norm_first: bool = False,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
 
@@ -315,11 +340,26 @@ class Transformer(Module):
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward, use_moe, num_experts, dropout,
-                                                activation, layer_norm_eps, batch_first, norm_first,
-                                                bias, **factory_kwargs)
-        decoder_norm = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, **factory_kwargs)
-        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, use_moe, decoder_norm)
+        decoder_layer = TransformerDecoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward,
+            use_moe,
+            num_experts,
+            dropout,
+            activation,
+            layer_norm_eps,
+            batch_first,
+            norm_first,
+            bias,
+            **factory_kwargs,
+        )
+        decoder_norm = LayerNorm(
+            d_model, eps=layer_norm_eps, bias=bias, **factory_kwargs
+        )
+        self.decoder = TransformerDecoder(
+            decoder_layer, num_decoder_layers, use_moe, decoder_norm
+        )
 
         self.projection = nn.Linear(d_model, n_vocab).to(device)
 
@@ -330,9 +370,16 @@ class Transformer(Module):
 
         self.batch_first = batch_first
 
-    def forward(self, src: Tensor, src_mask: Tensor, tgt: Tensor, memory_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None, tgt_is_causal: bool = True,
-                memory_is_causal: bool = False) -> Tensor:
+    def forward(
+        self,
+        src: Tensor,
+        src_mask: Tensor,
+        tgt: Tensor,
+        memory_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        tgt_is_causal: bool = True,
+        memory_is_causal: bool = False,
+    ) -> Tensor:
         r"""Take in and process masked source/target sequences.
 
         .. note::
@@ -408,17 +455,27 @@ class Transformer(Module):
         tgt = self.input_emb(tgt) * math.sqrt(self.d_model)
         tgt = self.pos_encoder(tgt)
         # tgt = tgt + tgt_pos
-        
+
         if self.use_moe:
-            with torch.cuda.amp.autocast(enabled =False):
-                output, sum_total_aux_loss = self.decoder(tgt, memory, memory_mask=memory_mask,                                
-                                    memory_key_padding_mask=memory_key_padding_mask,
-                                    tgt_is_causal=tgt_is_causal, memory_is_causal=memory_is_causal)
+            with torch.cuda.amp.autocast(enabled=False):
+                output, sum_total_aux_loss = self.decoder(
+                    tgt,
+                    memory,
+                    memory_mask=memory_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    tgt_is_causal=tgt_is_causal,
+                    memory_is_causal=memory_is_causal,
+                )
         else:
-            output = self.decoder(tgt, memory, memory_mask=memory_mask,                                
-                                memory_key_padding_mask=memory_key_padding_mask,
-                                tgt_is_causal=tgt_is_causal, memory_is_causal=memory_is_causal)
-        
+            output = self.decoder(
+                tgt,
+                memory,
+                memory_mask=memory_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                tgt_is_causal=tgt_is_causal,
+                memory_is_causal=memory_is_causal,
+            )
+
         output = self.projection(output)
         # output = F.log_softmax(output, dim=-1)
 
@@ -426,8 +483,14 @@ class Transformer(Module):
             return output, sum_total_aux_loss
         else:
             return output
-        
-    def generate(self, src: Tensor, src_mask: Tensor, max_len: int = 100, temperature: float = 1.0):
+
+    def generate(
+        self,
+        src: Tensor,
+        src_mask: Tensor,
+        max_len: int = 100,
+        temperature: float = 1.0,
+    ):
         ## ADD A START OF SEQUENCE TOKEN  <SS> token to the src tensor
         r"""Generate a sequence of tokens from the given inputs.
 
@@ -452,26 +515,40 @@ class Transformer(Module):
             # assert max_index < 21634, "tgt_fin contains index out of range. Adjust n_vocab or fix tgt_fin indices."
             tgt = tgt_fin
             if self.use_moe:
-                output, _ = self.froward(src, src_mask, tgt, memory_mask=None,                                
-                                memory_key_padding_mask=None,
-                                tgt_is_causal=True, memory_is_causal=False)
+                output, _ = self.forward(
+                    src,
+                    src_mask,
+                    tgt,
+                    memory_mask=None,
+                    memory_key_padding_mask=None,
+                    tgt_is_causal=True,
+                    memory_is_causal=False,
+                )
             else:
-                output = self.forward(src, src_mask, tgt, memory_mask=None,                                
-                                      memory_key_padding_mask=None,
-                                      tgt_is_causal=True, memory_is_causal=False)          
+                output = self.forward(
+                    src,
+                    src_mask,
+                    tgt,
+                    memory_mask=None,
+                    memory_key_padding_mask=None,
+                    tgt_is_causal=True,
+                    memory_is_causal=False,
+                )
             # logits = self.projection(output)
             logits = output
-            output = F.log_softmax(logits/temperature, dim=-1)
+            output = F.log_softmax(logits / temperature, dim=-1)
             output = output.view(-1, output.size(-1))
-            next_tokens = torch.multinomial(torch.exp(output), 1)[-1] # taking the last logit and adding to the sequence
+            next_tokens = torch.multinomial(torch.exp(output), 1)[
+                -1
+            ]  # taking the last logit and adding to the sequence
             tgt_fin = torch.cat((tgt_fin, next_tokens.unsqueeze(-1)), dim=1)
         return tgt_fin[:, 1:]
 
     @staticmethod
     def generate_square_subsequent_mask(
-            sz: int,
-            device: Optional[torch.device] = None,
-            dtype: Optional[torch.dtype] = None,
+        sz: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> Tensor:
         r"""Generate a square causal mask for the sequence.
 
@@ -479,14 +556,11 @@ class Transformer(Module):
         """
         return _generate_square_subsequent_mask(sz, dtype=dtype, device=device)
 
-
     def _reset_parameters(self):
         r"""Initiate parameters in the transformer model."""
         for p in self.parameters():
             if p.dim() > 1:
                 xavier_uniform_(p)
-
-
 
 
 class TransformerEncoder(Module):
@@ -509,7 +583,7 @@ class TransformerEncoder(Module):
         >>> out = transformer_encoder(src)
     """
 
-    __constants__ = ['norm']
+    __constants__ = ["norm"]
 
     def __init__(
         self,
@@ -517,7 +591,7 @@ class TransformerEncoder(Module):
         num_layers: int,
         norm: Optional[Module] = None,
         enable_nested_tensor: bool = True,
-        mask_check: bool = True
+        mask_check: bool = True,
     ) -> None:
         super().__init__()
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
@@ -531,37 +605,46 @@ class TransformerEncoder(Module):
         self.mask_check = mask_check
 
         enc_layer = "encoder_layer"
-        why_not_sparsity_fast_path = ''
+        why_not_sparsity_fast_path = ""
         if not isinstance(encoder_layer, torch.nn.TransformerEncoderLayer):
             why_not_sparsity_fast_path = f"{enc_layer} was not TransformerEncoderLayer"
-        elif encoder_layer.norm_first :
+        elif encoder_layer.norm_first:
             why_not_sparsity_fast_path = f"{enc_layer}.norm_first was True"
         elif not encoder_layer.self_attn.batch_first:
-            why_not_sparsity_fast_path = (f"{enc_layer}.self_attn.batch_first was not True" +
-                                          "(use batch_first for better inference performance)")
+            why_not_sparsity_fast_path = (
+                f"{enc_layer}.self_attn.batch_first was not True"
+                + "(use batch_first for better inference performance)"
+            )
         elif not encoder_layer.self_attn._qkv_same_embed_dim:
-            why_not_sparsity_fast_path = f"{enc_layer}.self_attn._qkv_same_embed_dim was not True"
+            why_not_sparsity_fast_path = (
+                f"{enc_layer}.self_attn._qkv_same_embed_dim was not True"
+            )
         elif encoder_layer.self_attn.in_proj_bias is None:
             why_not_sparsity_fast_path = f"{enc_layer}.self_attn was passed bias=False"
         elif not encoder_layer.activation_relu_or_gelu:
-            why_not_sparsity_fast_path = f"{enc_layer}.activation_relu_or_gelu was not True"
-        elif not (encoder_layer.norm1.eps == encoder_layer.norm2.eps) :
-            why_not_sparsity_fast_path = f"{enc_layer}.norm1.eps was not equal to {enc_layer}.norm2.eps"
+            why_not_sparsity_fast_path = (
+                f"{enc_layer}.activation_relu_or_gelu was not True"
+            )
+        elif not (encoder_layer.norm1.eps == encoder_layer.norm2.eps):
+            why_not_sparsity_fast_path = (
+                f"{enc_layer}.norm1.eps was not equal to {enc_layer}.norm2.eps"
+            )
         elif encoder_layer.self_attn.num_heads % 2 == 1:
             why_not_sparsity_fast_path = f"{enc_layer}.self_attn.num_heads is odd"
 
         if enable_nested_tensor and why_not_sparsity_fast_path:
-            warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+            warnings.warn(
+                f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}"
+            )
             self.use_nested_tensor = False
 
-
-
     def forward(
-            self,
-            src: Tensor,
-            mask: Optional[Tensor] = None,
-            src_key_padding_mask: Optional[Tensor] = None,
-            is_causal: Optional[bool] = None) -> Tensor:
+        self,
+        src: Tensor,
+        mask: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
+        is_causal: Optional[bool] = None,
+    ) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
 
         Args:
@@ -584,7 +667,7 @@ class TransformerEncoder(Module):
             mask_name="src_key_padding_mask",
             other_type=F._none_or_dtype(mask),
             other_name="mask",
-            target_type=src.dtype
+            target_type=src.dtype,
         )
 
         mask = F._canonical_mask(
@@ -600,7 +683,7 @@ class TransformerEncoder(Module):
         convert_to_nested = False
         first_layer = self.layers[0]
         src_key_padding_mask_for_layers = src_key_padding_mask
-        why_not_sparsity_fast_path = ''
+        why_not_sparsity_fast_path = ""
         str_first_layer = "self.layers[0]"
         batch_first = first_layer.self_attn.batch_first
         # is_fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
@@ -610,20 +693,29 @@ class TransformerEncoder(Module):
         if not hasattr(self, "use_nested_tensor"):
             why_not_sparsity_fast_path = "use_nested_tensor attribute not present"
         elif not self.use_nested_tensor:
-            why_not_sparsity_fast_path = "self.use_nested_tensor (set in init) was not True"
+            why_not_sparsity_fast_path = (
+                "self.use_nested_tensor (set in init) was not True"
+            )
         elif first_layer.training:
             why_not_sparsity_fast_path = f"{str_first_layer} was in training mode"
         elif not src.dim() == 3:
-            why_not_sparsity_fast_path = f"input not batched; expected src.dim() of 3 but got {src.dim()}"
+            why_not_sparsity_fast_path = (
+                f"input not batched; expected src.dim() of 3 but got {src.dim()}"
+            )
         elif src_key_padding_mask is None:
             why_not_sparsity_fast_path = "src_key_padding_mask was None"
-        elif (((not hasattr(self, "mask_check")) or self.mask_check)
-                and not torch._nested_tensor_from_mask_left_aligned(src, src_key_padding_mask.logical_not())):
+        elif (
+            (not hasattr(self, "mask_check")) or self.mask_check
+        ) and not torch._nested_tensor_from_mask_left_aligned(
+            src, src_key_padding_mask.logical_not()
+        ):
             why_not_sparsity_fast_path = "mask_check enabled, and src and src_key_padding_mask was not left aligned"
         elif output.is_nested:
             why_not_sparsity_fast_path = "NestedTensor input is not supported"
         elif mask is not None:
-            why_not_sparsity_fast_path = "src_key_padding_mask and mask were both supplied"
+            why_not_sparsity_fast_path = (
+                "src_key_padding_mask and mask were both supplied"
+            )
         elif torch.is_autocast_enabled():
             why_not_sparsity_fast_path = "autocast is enabled"
 
@@ -643,35 +735,48 @@ class TransformerEncoder(Module):
                 first_layer.linear2.weight,
                 first_layer.linear2.bias,
             )
-            _supported_device_type = ["cpu", "cuda", torch.utils.backend_registration._privateuse1_backend_name]
+            _supported_device_type = [
+                "cpu",
+                "cuda",
+                torch.utils.backend_registration._privateuse1_backend_name,
+            ]
             if torch.overrides.has_torch_function(tensor_args):
                 why_not_sparsity_fast_path = "some Tensor argument has_torch_function"
             elif src.device.type not in _supported_device_type:
-                why_not_sparsity_fast_path = f"src device is neither one of {_supported_device_type}"
+                why_not_sparsity_fast_path = (
+                    f"src device is neither one of {_supported_device_type}"
+                )
             elif torch.is_grad_enabled() and any(x.requires_grad for x in tensor_args):
-                why_not_sparsity_fast_path = ("grad is enabled and at least one of query or the "
-                                              "input/output projection weights or biases requires_grad")
+                why_not_sparsity_fast_path = (
+                    "grad is enabled and at least one of query or the "
+                    "input/output projection weights or biases requires_grad"
+                )
 
             if (not why_not_sparsity_fast_path) and (src_key_padding_mask is not None):
                 convert_to_nested = True
-                output = torch._nested_tensor_from_mask(output, src_key_padding_mask.logical_not(), mask_check=False)
+                output = torch._nested_tensor_from_mask(
+                    output, src_key_padding_mask.logical_not(), mask_check=False
+                )
                 src_key_padding_mask_for_layers = None
 
         seq_len = _get_seq_len(src, batch_first)
         is_causal = _detect_is_causal_mask(mask, is_causal, seq_len)
 
         for mod in self.layers:
-            output = mod(output, src_mask=mask, is_causal=is_causal, src_key_padding_mask=src_key_padding_mask_for_layers)
+            output = mod(
+                output,
+                src_mask=mask,
+                is_causal=is_causal,
+                src_key_padding_mask=src_key_padding_mask_for_layers,
+            )
 
         if convert_to_nested:
-            output = output.to_padded_tensor(0., src.size())
+            output = output.to_padded_tensor(0.0, src.size())
 
         if self.norm is not None:
             output = self.norm(output)
 
         return output
-
-
 
 
 class TransformerDecoder(Module):
@@ -690,14 +795,14 @@ class TransformerDecoder(Module):
         >>> out = transformer_decoder(tgt, memory)
     """
 
-    __constants__ = ['norm']
+    __constants__ = ["norm"]
 
     def __init__(
         self,
         decoder_layer: "TransformerDecoderLayer",
         num_layers: int,
         use_moe: bool = False,
-        norm: Optional[Module] = None
+        norm: Optional[Module] = None,
     ) -> None:
         super().__init__()
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
@@ -706,11 +811,16 @@ class TransformerDecoder(Module):
         self.use_moe = use_moe
         self.norm = norm
 
-
-    def forward(self, tgt: Tensor, memory: Tensor, tgt_mask: Optional[Tensor] = None,
-                memory_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None, tgt_is_causal: Optional[bool] = None,
-                memory_is_causal: bool = False) -> Tensor:
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        tgt_mask: Optional[Tensor] = None,
+        memory_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        tgt_is_causal: Optional[bool] = None,
+        memory_is_causal: bool = False,
+    ) -> Tensor:
         r"""Pass the inputs (and mask) through the decoder layer in turn.
 
         Args:
@@ -747,19 +857,25 @@ class TransformerDecoder(Module):
         if self.use_moe:
             sum_total_aux_loss = 0
             for mod in self.layers:
-                output, total_aux_loss, balance_loss, router_z_loss = mod(output, memory,
-                             memory_mask=memory_mask,
-                             memory_key_padding_mask=memory_key_padding_mask,
-                             tgt_is_causal=tgt_is_causal,
-                             memory_is_causal=memory_is_causal)
+                output, total_aux_loss, balance_loss, router_z_loss = mod(
+                    output,
+                    memory,
+                    memory_mask=memory_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    tgt_is_causal=tgt_is_causal,
+                    memory_is_causal=memory_is_causal,
+                )
                 sum_total_aux_loss += total_aux_loss
         else:
             for mod in self.layers:
-                output = mod(output, memory,
-                            memory_mask=memory_mask,                            
-                            memory_key_padding_mask=memory_key_padding_mask,
-                            tgt_is_causal=tgt_is_causal,
-                            memory_is_causal=memory_is_causal)
+                output = mod(
+                    output,
+                    memory,
+                    memory_mask=memory_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    tgt_is_causal=tgt_is_causal,
+                    memory_is_causal=memory_is_causal,
+                )
 
         if self.norm is not None:
             output = self.norm(output)
@@ -768,7 +884,6 @@ class TransformerDecoder(Module):
             return output, sum_total_aux_loss
         else:
             return output
-
 
 
 class TransformerEncoderLayer(Module):
@@ -846,17 +961,32 @@ class TransformerEncoderLayer(Module):
 
     """
 
-    __constants__ = ['norm_first']
+    __constants__ = ["norm_first"]
 
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1,
-                 activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
-                 layer_norm_eps: float = 1e-5, batch_first: bool = False, norm_first: bool = False,
-                 bias: bool = True, device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
+        layer_norm_eps: float = 1e-5,
+        batch_first: bool = False,
+        norm_first: bool = False,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout,
-                                            bias=bias, batch_first=batch_first,
-                                            **factory_kwargs)
+        self.self_attn = MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            bias=bias,
+            batch_first=batch_first,
+            **factory_kwargs,
+        )
         # Implementation of Feedforward model
         self.linear1 = Linear(d_model, dim_feedforward, bias=bias, **factory_kwargs)
         self.dropout = Dropout(dropout)
@@ -884,17 +1014,16 @@ class TransformerEncoderLayer(Module):
 
     def __setstate__(self, state):
         super().__setstate__(state)
-        if not hasattr(self, 'activation'):
+        if not hasattr(self, "activation"):
             self.activation = F.relu
 
-
-
     def forward(
-            self,
-            src: Tensor,
-            src_mask: Optional[Tensor] = None,
-            src_key_padding_mask: Optional[Tensor] = None,
-            is_causal: bool = False) -> Tensor:
+        self,
+        src: Tensor,
+        src_mask: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
+        is_causal: bool = False,
+    ) -> Tensor:
         r"""Pass the input through the encoder layer.
 
         Args:
@@ -917,7 +1046,7 @@ class TransformerEncoderLayer(Module):
             mask_name="src_key_padding_mask",
             other_type=F._none_or_dtype(src_mask),
             other_name="src_mask",
-            target_type=src.dtype
+            target_type=src.dtype,
         )
 
         src_mask = F._canonical_mask(
@@ -932,11 +1061,13 @@ class TransformerEncoderLayer(Module):
         # is_fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
 
         # see Fig. 1 of https://arxiv.org/pdf/2002.04745v1.pdf
-        why_not_sparsity_fast_path = ''
+        why_not_sparsity_fast_path = ""
         # if not is_fastpath_enabled:
         #     why_not_sparsity_fast_path = "torch.backends.mha.get_fastpath_enabled() was not True"
         if not src.dim() == 3:
-            why_not_sparsity_fast_path = f"input not batched; expected src.dim() of 3 but got {src.dim()}"
+            why_not_sparsity_fast_path = (
+                f"input not batched; expected src.dim() of 3 but got {src.dim()}"
+            )
         elif self.training:
             why_not_sparsity_fast_path = "training is enabled"
         elif not self.self_attn.batch_first:
@@ -949,7 +1080,9 @@ class TransformerEncoderLayer(Module):
             why_not_sparsity_fast_path = "activation_relu_or_gelu was not True"
         elif not (self.norm1.eps == self.norm2.eps):
             why_not_sparsity_fast_path = "norm1.eps is not equal to norm2.eps"
-        elif src.is_nested and (src_key_padding_mask is not None or src_mask is not None):
+        elif src.is_nested and (
+            src_key_padding_mask is not None or src_mask is not None
+        ):
             why_not_sparsity_fast_path = "neither src_key_padding_mask nor src_mask are not supported with NestedTensor input"
         elif self.self_attn.num_heads % 2 == 1:
             why_not_sparsity_fast_path = "num_head is odd"
@@ -974,18 +1107,30 @@ class TransformerEncoderLayer(Module):
 
             # We have to use list comprehensions below because TorchScript does not support
             # generator expressions.
-            _supported_device_type = ["cpu", "cuda", torch.utils.backend_registration._privateuse1_backend_name]
+            _supported_device_type = [
+                "cpu",
+                "cuda",
+                torch.utils.backend_registration._privateuse1_backend_name,
+            ]
             if torch.overrides.has_torch_function(tensor_args):
                 why_not_sparsity_fast_path = "some Tensor argument has_torch_function"
-            elif not all((x.device.type in _supported_device_type) for x in tensor_args):
-                why_not_sparsity_fast_path = ("some Tensor argument's device is neither one of "
-                                              f"{_supported_device_type}")
+            elif not all(
+                (x.device.type in _supported_device_type) for x in tensor_args
+            ):
+                why_not_sparsity_fast_path = (
+                    "some Tensor argument's device is neither one of "
+                    f"{_supported_device_type}"
+                )
             elif torch.is_grad_enabled() and any(x.requires_grad for x in tensor_args):
-                why_not_sparsity_fast_path = ("grad is enabled and at least one of query or the "
-                                              "input/output projection weights or biases requires_grad")
+                why_not_sparsity_fast_path = (
+                    "grad is enabled and at least one of query or the "
+                    "input/output projection weights or biases requires_grad"
+                )
 
             if not why_not_sparsity_fast_path:
-                merged_mask, mask_type = self.self_attn.merge_masks(src_mask, src_key_padding_mask, src)
+                merged_mask, mask_type = self.self_attn.merge_masks(
+                    src_mask, src_key_padding_mask, src
+                )
                 return torch._transformer_encoder_layer_fwd(
                     src,
                     self.self_attn.embed_dim,
@@ -1009,33 +1154,44 @@ class TransformerEncoderLayer(Module):
                     mask_type,
                 )
 
-
         x = src
         if self.norm_first:
-            x = x + self._sa_block(self.norm1(x), src_mask, src_key_padding_mask, is_causal=is_causal)
+            x = x + self._sa_block(
+                self.norm1(x), src_mask, src_key_padding_mask, is_causal=is_causal
+            )
             x = x + self._ff_block(self.norm2(x))
         else:
-            x = self.norm1(x + self._sa_block(x, src_mask, src_key_padding_mask, is_causal=is_causal))
+            x = self.norm1(
+                x
+                + self._sa_block(x, src_mask, src_key_padding_mask, is_causal=is_causal)
+            )
             x = self.norm2(x + self._ff_block(x))
 
         return x
 
-
     # self-attention block
-    def _sa_block(self, x: Tensor,
-                  attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor], is_causal: bool = False) -> Tensor:
-        x = self.self_attn(x, x, x,
-                           attn_mask=attn_mask,
-                           key_padding_mask=key_padding_mask,
-                           need_weights=False, is_causal=is_causal)[0]
+    def _sa_block(
+        self,
+        x: Tensor,
+        attn_mask: Optional[Tensor],
+        key_padding_mask: Optional[Tensor],
+        is_causal: bool = False,
+    ) -> Tensor:
+        x = self.self_attn(
+            x,
+            x,
+            x,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+            is_causal=is_causal,
+        )[0]
         return self.dropout1(x)
 
     # feed forward block
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout2(x)
-
-
 
 
 class TransformerDecoderLayer(Module):
@@ -1076,36 +1232,54 @@ class TransformerDecoderLayer(Module):
         >>> out = decoder_layer(tgt, memory)
     """
 
-    __constants__ = ['norm_first']
+    __constants__ = ["norm_first"]
 
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, use_moe: bool = False, num_experts: int = 16,
-                 dropout: float = 0.1, activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
-                 layer_norm_eps: float = 1e-5, batch_first: bool = False, norm_first: bool = False,
-                 bias: bool = True, device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        use_moe: bool = False,
+        num_experts: int = 16,
+        dropout: float = 0.1,
+        activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
+        layer_norm_eps: float = 1e-5,
+        batch_first: bool = False,
+        norm_first: bool = False,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
-        self.self_attn = MultiHeadSelfAttention(d_model, nhead, dropout=dropout, batch_first=batch_first, **factory_kwargs) 
-        self.multihead_attn = MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first,
-                                                 bias=bias, **factory_kwargs)
+        self.self_attn = MultiHeadSelfAttention(
+            d_model, nhead, dropout=dropout, batch_first=batch_first, **factory_kwargs
+        )
+        self.multihead_attn = MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=batch_first,
+            bias=bias,
+            **factory_kwargs,
+        )
         self.use_moe = use_moe
 
         if use_moe:
             self.moe = MoE(
-                dim = d_model,
-                num_experts = num_experts,      # increase the experts (# parameters) of your model without increasing computation
-                gating_top_n = 2,               # default to top 2 gating, but can also be more (3 was tested in the paper with a lower threshold)
-                threshold_train = 0.2,          # at what threshold to accept a token to be routed to second expert and beyond - 0.2 was optimal for 2 expert routing, and apparently should be lower for 3
-                threshold_eval = 0.2,
-                capacity_factor_train = 1.25,   # experts have fixed capacity per batch. we need some extra capacity in case gating is not perfectly balanced.
-                capacity_factor_eval = 2.,      # capacity_factor_* should be set to a value >=1
-                balance_loss_coef = 1e-2,       # multiplier on the auxiliary expert balancing auxiliary loss
-                router_z_loss_coef = 1e-3,      # loss weight for router z-loss
+                dim=d_model,
+                num_experts=num_experts,  # increase the experts (# parameters) of your model without increasing computation
+                gating_top_n=2,  # default to top 2 gating, but can also be more (3 was tested in the paper with a lower threshold)
+                threshold_train=0.2,  # at what threshold to accept a token to be routed to second expert and beyond - 0.2 was optimal for 2 expert routing, and apparently should be lower for 3
+                threshold_eval=0.2,
+                capacity_factor_train=1.25,  # experts have fixed capacity per batch. we need some extra capacity in case gating is not perfectly balanced.
+                capacity_factor_eval=2.0,  # capacity_factor_* should be set to a value >=1
+                balance_loss_coef=1e-2,  # multiplier on the auxiliary expert balancing auxiliary loss
+                router_z_loss_coef=1e-3,  # loss weight for router z-loss
             ).to(device)
             self.moe_block = SparseMoEBlock(
-                self.moe,
-                add_ff_before = True,
-                add_ff_after = True
+                self.moe, add_ff_before=True, add_ff_after=True
             ).to(device)
         else:
             # Implementation of Feedforward model
@@ -1128,10 +1302,9 @@ class TransformerDecoderLayer(Module):
             self.activation = activation
 
     def __setstate__(self, state):
-        if 'activation' not in state:
-            state['activation'] = F.relu
+        if "activation" not in state:
+            state["activation"] = F.relu
         super().__setstate__(state)
-
 
     def forward(
         self,
@@ -1174,7 +1347,13 @@ class TransformerDecoderLayer(Module):
         # print(f'target is causal: {tgt_is_causal}')
         if self.norm_first:
             x = x + self._sa_block(self.norm1(x), tgt_is_causal)
-            x = x + self._mha_block(self.norm2(x), memory, memory_mask, memory_key_padding_mask, memory_is_causal)
+            x = x + self._mha_block(
+                self.norm2(x),
+                memory,
+                memory_mask,
+                memory_key_padding_mask,
+                memory_is_causal,
+            )
             if self.use_moe:
                 m, total_aux_loss, balance_loss, router_z_loss = self.moe_block(x)
                 x = x + m
@@ -1182,7 +1361,12 @@ class TransformerDecoderLayer(Module):
                 x = x + self._ff_block(self.norm3(x))
         else:
             x = self.norm1(x + self._sa_block(x, tgt_is_causal))
-            x = self.norm2(x + self._mha_block(x, memory, memory_mask, memory_key_padding_mask, memory_is_causal))
+            x = self.norm2(
+                x
+                + self._mha_block(
+                    x, memory, memory_mask, memory_key_padding_mask, memory_is_causal
+                )
+            )
             if self.use_moe:
                 m, total_aux_loss, balance_loss, router_z_loss = self.moe_block(x)
                 x = x + m
@@ -1194,28 +1378,35 @@ class TransformerDecoderLayer(Module):
         else:
             return x
 
-
     # self-attention block
-    def _sa_block(self, x: Tensor,
-                  is_causal: bool = False) -> Tensor:
+    def _sa_block(self, x: Tensor, is_causal: bool = False) -> Tensor:
         x = self.self_attn(x, is_causal=is_causal)
         return self.dropout1(x)
 
     # multihead attention block
-    def _mha_block(self, x: Tensor, mem: Tensor,
-                   attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor], is_causal: bool = False) -> Tensor:
-        x = self.multihead_attn(x, mem, mem,
-                                attn_mask=attn_mask,
-                                key_padding_mask=key_padding_mask,
-                                is_causal=is_causal,
-                                need_weights=False)[0]
+    def _mha_block(
+        self,
+        x: Tensor,
+        mem: Tensor,
+        attn_mask: Optional[Tensor],
+        key_padding_mask: Optional[Tensor],
+        is_causal: bool = False,
+    ) -> Tensor:
+        x = self.multihead_attn(
+            x,
+            mem,
+            mem,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            is_causal=is_causal,
+            need_weights=False,
+        )[0]
         return self.dropout2(x)
 
     # feed forward block
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout3(x)
-
 
 
 def _get_clones(module, N):
@@ -1233,9 +1424,9 @@ def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
 
 
 def _detect_is_causal_mask(
-        mask: Optional[Tensor],
-        is_causal: Optional[bool] = None,
-        size: Optional[int] = None,
+    mask: Optional[Tensor],
+    is_causal: Optional[bool] = None,
+    size: Optional[int] = None,
 ) -> bool:
     """Return whether the given attention mask is causal.
 
@@ -1257,12 +1448,13 @@ def _detect_is_causal_mask(
        Otherwise, checks for any causal mask.
     """
     # Prevent type refinement
-    make_causal = (is_causal is True)
+    make_causal = is_causal is True
 
     if is_causal is None and mask is not None:
         sz = size if size is not None else mask.size(-2)
         causal_comparison = _generate_square_subsequent_mask(
-            sz, device=mask.device, dtype=mask.dtype)
+            sz, device=mask.device, dtype=mask.dtype
+        )
 
         # Do not use `torch.equal` so we handle batched masks by
         # broadcasting the comparison.
@@ -1273,10 +1465,29 @@ def _detect_is_causal_mask(
 
     return make_causal
 
+
 def check_instruments(genereated_seq):
     ins_present = []
     ins_count = 0
-    instrument_list = ["piano", "chromatic", "organ", "guitar", "bass", "strings", "ensemble", "brass", "reed", "drum", "pipe", "synth_lead", "synth_pad", "synth_effect", "ethnic", "percussive", "sfx"]
+    instrument_list = [
+        "piano",
+        "chromatic",
+        "organ",
+        "guitar",
+        "bass",
+        "strings",
+        "ensemble",
+        "brass",
+        "reed",
+        "drum",
+        "pipe",
+        "synth_lead",
+        "synth_pad",
+        "synth_effect",
+        "ethnic",
+        "percussive",
+        "sfx",
+    ]
     for token in genereated_seq:
         try:
             ins, pitch, vel = token
@@ -1288,17 +1499,18 @@ def check_instruments(genereated_seq):
                 ins = token
         if str(ins) in instrument_list:
             # print('coming here')
-            
-            if ('prefix', 'instrument', str(ins)) not in ins_present and ins_count < 15:
+
+            if ("prefix", "instrument", str(ins)) not in ins_present and ins_count < 15:
                 ins_count += 1
-                print(f'adding instrument {ins}')
-                ins_present.append(('prefix', 'instrument', str(ins)))
+                print(f"adding instrument {ins}")
+                ins_present.append(("prefix", "instrument", str(ins)))
     if ins_present != []:
-        genereated_seq = ins_present + ['<S>']+ genereated_seq +['<E>']
+        genereated_seq = ins_present + ["<S>"] + genereated_seq + ["<E>"]
     else:
-        genereated_seq = genereated_seq +['<E>']
+        genereated_seq = genereated_seq + ["<E>"]
     print(genereated_seq)
-    return genereated_seq 
+    return genereated_seq
+
 
 def process_caption(gpu_id, captions, model, tokenizer, r_tokenizer):
     # Detect device: CUDA, MPS, or CPU
@@ -1318,23 +1530,30 @@ def process_caption(gpu_id, captions, model, tokenizer, r_tokenizer):
     model.eval()
 
     for caption in captions:
-        src = caption['caption']
-        location = caption['location']
+        src = caption["caption"]
+        location = caption["location"]
 
         # Tokenize input
-        inputs = tokenizer(src, return_tensors='pt', padding=True, truncation=True)
-        input_ids = nn.utils.rnn.pad_sequence(inputs.input_ids, batch_first=True, padding_value=0)
+        inputs = tokenizer(src, return_tensors="pt", padding=True, truncation=True)
+        input_ids = nn.utils.rnn.pad_sequence(
+            inputs.input_ids, batch_first=True, padding_value=0
+        )
         input_ids = input_ids.to(device)
-        attention_mask = nn.utils.rnn.pad_sequence(inputs.attention_mask, batch_first=True, padding_value=0)
+        attention_mask = nn.utils.rnn.pad_sequence(
+            inputs.attention_mask, batch_first=True, padding_value=0
+        )
         attention_mask = attention_mask.to(device)
 
         # Generate output
-        output = model.generate(input_ids, attention_mask, max_len=5000, temperature=0.9)
+        output = model.generate(
+            input_ids, attention_mask, max_len=5000, temperature=0.9
+        )
         output_list = output[0].tolist()
 
         # Decode MIDI and save it
         generated_midi = r_tokenizer.decode(output_list)
         generated_midi.dump_midi(f"../res/{location}")
+
 
 # def process_caption(gpu_id, captions, model, tokenizer, r_tokenizer):
 #     device = gpu_id
@@ -1350,9 +1569,9 @@ def process_caption(gpu_id, captions, model, tokenizer, r_tokenizer):
 #         example 2: "A melodic electronic song with ambient elements, featuring piano, acoustic guitar, alto saxophone, string ensemble, and electric bass. Set in G minor with a 4/4 time signature, it moves at a lively Presto tempo. The composition evokes a blend of relaxation and darkness, with hints of happiness and a meditative quality."lmd_full/1/152891ac63017b234c33e75e4a4a28c5.mid
 #         example 3: "This motivational electronic and pop song features a clean electric guitar, rock organ, synth voice, acoustic guitar, and vibraphone, creating a melodic and uplifting atmosphere. Set in the key of G# minor with a 4/4 time signature, the track moves at an energetic Allegro tempo of 120 beats per minute. The chord progression of Bbm7 and F# adds to the song's inspiring and corporate feel." lmd_full/1/14347e50e9e8149a9da09f49b188180b.mid
 #         example 4: "This short electronic song in C minor features a brass section, string ensemble, tenor saxophone, clean electric guitar, and slap bass, creating a melodic and slightly dark atmosphere. With a tempo of 124 BPM (Allegro) and a 4/4 time signature, the track incorporates a chord progression of C7/E, Eb6, and Bbm6, adding a touch of corporate and motivational vibes to the overall composition." lmd_full/1/1dc4cd50a5509d8042d27d80bc7e668e.mid
-#         example 5: "An energetic and melodic electronic trance track with a space and retro vibe, featuring drums, distortion guitar, flute, synth bass, and slap bass. Set in A minor with a fast tempo of 138 BPM, the song maintains a 4/4 time signature throughout its duration." lmd_full/3/3328b854ebe7a2fc9a746ede74c410ae.mid  
-#         example 6: "A short but energetic rock fragment in C minor, featuring overdriven guitars, electric bass, and drums, with a vivacious tempo of 155 BPM and a 4/4 time signature, evoking a blend of dark and melodic tones." lmd_full/4/4c2232688c5f869b8470a408d197f5e3.mid 
-#         example 7: "A classical piece with a cinematic flair, this composition is characterized by its fast tempo and 4/4 time signature. The soprano saxophone and flute take turns leading the melody, supported by the lush tones of the string ensemble, acoustic bass, and pan flute. Set in the key of F minor, the harmonic landscape is painted with the chords Gm7b5, Cm7b5, Fm7, Eaug, and Ab/Eb. The overall mood evokes images of film, with hints of Christmas, drama, documentary, and adventure." lmd_full/9/95bce1b489a11829b4fef39200291f60.mid 
+#         example 5: "An energetic and melodic electronic trance track with a space and retro vibe, featuring drums, distortion guitar, flute, synth bass, and slap bass. Set in A minor with a fast tempo of 138 BPM, the song maintains a 4/4 time signature throughout its duration." lmd_full/3/3328b854ebe7a2fc9a746ede74c410ae.mid
+#         example 6: "A short but energetic rock fragment in C minor, featuring overdriven guitars, electric bass, and drums, with a vivacious tempo of 155 BPM and a 4/4 time signature, evoking a blend of dark and melodic tones." lmd_full/4/4c2232688c5f869b8470a408d197f5e3.mid
+#         example 7: "A classical piece with a cinematic flair, this composition is characterized by its fast tempo and 4/4 time signature. The soprano saxophone and flute take turns leading the melody, supported by the lush tones of the string ensemble, acoustic bass, and pan flute. Set in the key of F minor, the harmonic landscape is painted with the chords Gm7b5, Cm7b5, Fm7, Eaug, and Ab/Eb. The overall mood evokes images of film, with hints of Christmas, drama, documentary, and adventure." lmd_full/9/95bce1b489a11829b4fef39200291f60.mid
 #         exmaple 8: "A slow, dark, and emotional classical piece featuring cello, violin, and viola, likely to be used in a dramatic film soundtrack. The composition is in the key of C minor with a 4/4 time signature, and the main chord progression consists of Cm, G, Cm, and Fm." lmd_full/a/a22aad98ecfe4b3d8a353c2a72132834.mid
 #         example 9: "A slow and emotional classical piece, likely used in a film soundtrack, featuring a church organ as the sole instrument. Written in the key of Eb major with a 3/4 time signature, it evokes a sense of drama and romance. The chord progression of Bb7, Eb, and Ab contributes to the relaxing atmosphere throughout the song." lmd_full/a/af4302a036c9df71e0435df9b08f8c4b.mid
 #         example 10: "A cinematic electronic soundtrack that evokes an epic and dark atmosphere, featuring cello, contrabass, and drums. The song is set in A minor with a moderate tempo and a 4/4 time signature, creating an emotional and action-packed ambiance suitable for film." lmd_full/d/d920b6f451d7a72ae06f154e7c06c4c1.mid
@@ -1360,7 +1579,7 @@ def process_caption(gpu_id, captions, model, tokenizer, r_tokenizer):
 #         inputs = tokenizer(src, return_tensors='pt', padding=True, truncation=True)
 #         input_ids = nn.utils.rnn.pad_sequence(inputs.input_ids, batch_first=True, padding_value=0)
 #         input_ids = input_ids.to(device)
-#         attention_mask =nn.utils.rnn.pad_sequence(inputs.attention_mask, batch_first=True, padding_value=0) 
+#         attention_mask =nn.utils.rnn.pad_sequence(inputs.attention_mask, batch_first=True, padding_value=0)
 #         attention_mask = attention_mask.to(device)
 #         output = model.generate(input_ids, attention_mask,max_len=5000,temperature = 0.9)
 #         output_list = output[0].tolist()
@@ -1378,6 +1597,7 @@ def process_caption(gpu_id, captions, model, tokenizer, r_tokenizer):
 #         # print(type(generated_midi))
 #         generated_midi.dump_midi(f"../res/{location}")
 
+
 def test_generate(caption):
     # Detect device: CUDA, MPS, or CPU
     if torch.cuda.is_available():
@@ -1390,10 +1610,10 @@ def test_generate(caption):
         device = torch.device("cpu")
         print("Using CPU")
 
-    artifact_folder = '../artifacts'
+    artifact_folder = "../artifacts"
     tokenizer_filepath = os.path.join(artifact_folder, "vocab_remi.pkl")
-    caption_dataset_path = '/root/text2midi/captions/train.json'
-    print(f'caption_dataset_path: {caption_dataset_path}')
+    caption_dataset_path = "../captions/train.json"
+    print(f"caption_dataset_path: {caption_dataset_path}")
 
     # Load the tokenizer dictionary
     with open(tokenizer_filepath, "rb") as f:
@@ -1403,14 +1623,16 @@ def test_generate(caption):
 
     # Initialize model
     model = Transformer(vocab_size, 768, 8, 2048, 18, 1024, False, 8, device=device)
-    model.load_state_dict(torch.load('/root/test/text2midi/output_new/epoch_30/pytorch_model.bin', map_location=device))
+    model.load_state_dict(
+        torch.load("../artifacts/pytorch_model.bin", map_location=device)
+    )
     model.to(device)  # Move model to detected device
     model.eval()
 
     # Prepare input
     tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-base")
-    
-    '''
+
+    """
     # num_gpus = torch.cuda.device_count()
     # captions_per_gpu = len(captions) // num_gpus
     # processes = []
@@ -1423,7 +1645,7 @@ def test_generate(caption):
 
     # for p in processes:
     #     p.join()
-    '''
+    """
     # src = "A pop song with nostalgic feeling."
     # src = "A happy christmas song suitable for festive mood."
     # src = "A melodic electronic song with ambient elements, featuring piano, acoustic guitar, alto saxophone, string ensemble, and electric bass. Set in G minor with a 4/4 time signature, it moves at a lively Presto tempo. The composition evokes a blend of relaxation and darkness, with hints of happiness and a meditative quality."
@@ -1433,10 +1655,14 @@ def test_generate(caption):
     # src="This motivational electronic and pop song features a clean electric guitar, rock organ, synth voice, acoustic guitar, and vibraphone, creating a melodic and uplifting atmosphere. Set in the key of G# minor with a 4/4 time signature, the track moves at an energetic Allegro tempo of 120 beats per minute. The chord progression of Bbm7 and F# adds to the song's inspiring and corporate feel."
     # src = "Played at 149 beats per minute in 2/4 time signature and the key of G major, classical piece with instruments: bassoon, clarinet, flute, horn, oboe, and trumpet."
     # src= 'Played at 114 beats per minute in 1/4 time signature and the key of g# minor, classical piece with the following instruments: clarinet, english horn, flute, horn, piccolo, trombone, and trumpet.'
-    inputs = tokenizer(caption, return_tensors='pt', padding=True, truncation=True)
-    input_ids = nn.utils.rnn.pad_sequence(inputs.input_ids, batch_first=True, padding_value=0)
+    inputs = tokenizer(caption, return_tensors="pt", padding=True, truncation=True)
+    input_ids = nn.utils.rnn.pad_sequence(
+        inputs.input_ids, batch_first=True, padding_value=0
+    )
     input_ids = input_ids.to(device)
-    attention_mask = nn.utils.rnn.pad_sequence(inputs.attention_mask, batch_first=True, padding_value=0)
+    attention_mask = nn.utils.rnn.pad_sequence(
+        inputs.attention_mask, batch_first=True, padding_value=0
+    )
     attention_mask = attention_mask.to(device)
     output = model.generate(input_ids, attention_mask, max_len=2000, temperature=0.9)
     output_list = output[0].tolist()
@@ -1444,6 +1670,7 @@ def test_generate(caption):
     # Decode and save MIDI
     generated_midi = r_tokenizer.decode(output_list)
     generated_midi.dump_midi(f"../../output_christmas_2.mid")
+
 
 def load_model_and_tokenizer(accelerator, model_path, vocab_size, tokenizer_filepath):
     device = accelerator.device
@@ -1456,54 +1683,83 @@ def load_model_and_tokenizer(accelerator, model_path, vocab_size, tokenizer_file
     tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-base")
     return model, tokenizer, r_tokenizer
 
-def process_example(accelerator, model, tokenizer, r_tokenizer, example, location, output_path):
+
+def process_example(
+    accelerator, model, tokenizer, r_tokenizer, example, location, output_path
+):
     device = accelerator.device
-    inputs = tokenizer(example, return_tensors='pt', padding=True, truncation=True).to(device)
-    input_ids = inputs['input_ids']
-    attention_mask = inputs['attention_mask']
+    inputs = tokenizer(example, return_tensors="pt", padding=True, truncation=True).to(
+        device
+    )
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
     with torch.no_grad():
-        output = model.module.generate(input_ids, attention_mask, max_len=2000, temperature=0.9)
+        output = model.module.generate(
+            input_ids, attention_mask, max_len=2000, temperature=0.9
+        )
     output_list = output[0].tolist()
     generated_midi = r_tokenizer.decode(output_list)
     generated_midi.dump_midi(output_path)
 
+
 def run_accelerate_generation():
     accelerator = Accelerator()
-    artifact_folder = '../artifacts'
+    artifact_folder = "../artifacts"
     tokenizer_filepath = os.path.join(artifact_folder, "vocab_remi.pkl")
-    model_path = '/root/output_test_new/epoch_30/pytorch_model.bin'
-    captions_path = '/root/captions/train.json'
-    
+    model_path = "../artifacts/pytorch_model.bin"
+    captions_path = "../captions/captions.json"
+
     with jsonlines.open(captions_path) as reader:
-        selected_captions = [line for line in reader if line.get('test_set') is True]
-    
+        selected_captions = [line for line in reader if line.get("test_set") is True]
+
     with open(tokenizer_filepath, "rb") as f:
         r_tokenizer = pickle.load(f)
-    
-    model, tokenizer, r_tokenizer = load_model_and_tokenizer(accelerator, model_path, len(r_tokenizer), tokenizer_filepath)
+
+    model, tokenizer, r_tokenizer = load_model_and_tokenizer(
+        accelerator, model_path, len(r_tokenizer), tokenizer_filepath
+    )
     model = accelerator.prepare(model)
-    
+
     dataset = CaptionDataset(selected_captions)
-    dataloader = DataLoader(dataset, batch_size=8, num_workers=4, shuffle=False, collate_fn=custom_collate_fn)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=8,
+        num_workers=4,
+        shuffle=False,
+        collate_fn=custom_collate_fn,
+    )
     dataloader = accelerator.prepare(dataloader)
-    
+
     for captions, locations in dataloader:
         for example, location in zip(captions, locations):
-            output_path = os.path.join(f'/root/Text2midi/res_acc', location)
+            output_path = os.path.join(f"/root/Text2midi/res_acc", location)
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            process_example(accelerator, model, tokenizer, r_tokenizer, example, location, output_path)
-            
+            process_example(
+                accelerator,
+                model,
+                tokenizer,
+                r_tokenizer,
+                example,
+                location,
+                output_path,
+            )
+
+
 # run_accelerate_generation() #uncomment this and comment __main__ to run accelerate generation
+
 
 def main():
     parser = argparse.ArgumentParser(description="Generate MIDI from caption")
-    parser.add_argument('--caption', type=str, required=True, help='Caption to generate MIDI from')
+    parser.add_argument(
+        "--caption", type=str, required=True, help="Caption to generate MIDI from"
+    )
     args = parser.parse_args()
     test_generate(args.caption)
 
-'''
+
+"""
 comment out the next section function and uncomment the run_accelerate_generation() function to run the accelerate generation
-'''
+"""
 if __name__ == "__main__":
     main()
     print("Done")

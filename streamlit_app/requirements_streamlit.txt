@@ -1,0 +1,21 @@
+# Streamlit App Requirements
+# Install with: pip install -r requirements_streamlit.txt
+
+# Core dependencies (from main project)
+torch>=2.0.0
+transformers>=4.30.0
+miditok>=3.0.0
+aria-amt>=0.1.0
+
+# Streamlit
+streamlit>=1.28.0
+
+# Audio processing
+fluidsynth  # Note: Also requires system FluidSynth installation
+
+# Data processing
+numpy>=1.24.0
+pyyaml>=6.0
+
+# Additional utilities
+Pillow>=10.0.0
