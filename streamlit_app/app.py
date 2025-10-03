@@ -272,9 +272,7 @@ def main():
 
                         # Save MIDI file to streamlit_app/generated/midi/
                         midi_path = save_midi_file(
-                            midi_object,
-                            GENERATED_MIDI_DIR,
-                            filename_prefix="generated"
+                            midi_object, GENERATED_MIDI_DIR, filename_prefix="generated"
                         )
 
                         progress_bar.progress(80)
@@ -289,12 +287,9 @@ def main():
 
                     # Create summary
                     summary = get_generation_summary(
-                        clean_prompt,
-                        gen_time,
-                        num_tokens,
-                        str(midi_path)
+                        clean_prompt, gen_time, num_tokens, str(midi_path)
                     )
-                    
+
                     # Add audio path if available
                     if audio_success:
                         summary["audio_path"] = str(audio_path)
