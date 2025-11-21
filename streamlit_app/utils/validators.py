@@ -57,15 +57,13 @@ def sanitize_prompt(prompt):
     return prompt
 
 
-def validate_generation_params(max_length, temperature, top_k, top_p):
+def validate_generation_params(max_length, temperature):
     """
     Validate generation parameters
 
     Args:
         max_length: Maximum sequence length
         temperature: Sampling temperature
-        top_k: Top-k sampling parameter
-        top_p: Top-p (nucleus) sampling parameter
 
     Returns:
         tuple: (is_valid, error_message)
@@ -77,13 +75,5 @@ def validate_generation_params(max_length, temperature, top_k, top_p):
     # Check temperature
     if not (0.1 <= temperature <= 2.0):
         return False, "Temperature must be between 0.1 and 2.0"
-
-    # Check top_k
-    if not (0 <= top_k <= 100):
-        return False, "Top-k must be between 0 and 100"
-
-    # Check top_p
-    if not (0.0 <= top_p <= 1.0):
-        return False, "Top-p must be between 0.0 and 1.0"
 
     return True, None

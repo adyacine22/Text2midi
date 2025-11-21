@@ -36,6 +36,7 @@ from components.generator import (
 )
 from components.history import render_history_section, add_to_history
 from components.prompt_library import render_quick_examples, render_prompt_library
+from instruments_mapping import INSTRUMENT_CLASSES
 
 
 # Page configuration
@@ -195,6 +196,22 @@ def main():
     else:
         st.caption(f"{char_count}/500")
 
+    # Instrument class selection (shown directly under the prompt)
+    instrument_options = sorted(INSTRUMENT_CLASSES.keys())
+    selected_instruments = st.multiselect(
+        "Allowed instrument classes (optional)",
+        options=instrument_options,
+        default=[],
+        help=(
+            "Select high-level instrument classes to allow "
+            "(e.g., Piano, Strings, Drums). Leave empty to "
+            "allow all instruments."
+        ),
+    )
+    instrument_programs = []
+    for cls in selected_instruments:
+        instrument_programs.extend(INSTRUMENT_CLASSES.get(cls, []))
+
     # Settings expander (minimal)
     with st.expander("⚙️ Settings"):
         col1, col2 = st.columns(2)
@@ -210,20 +227,7 @@ def main():
                 0.1,
                 help="Higher = more creative, Lower = more predictable",
             )
-        with col2:
-            # Note: top_k and top_p are kept for UI consistency but not currently used by the model
-            top_k = st.slider(
-                "Top-k", 0, 100, 0, 10, help="Not used by current model", disabled=True
-            )
-            top_p = st.slider(
-                "Top-p",
-                0.0,
-                1.0,
-                0.0,
-                0.1,
-                help="Not used by current model",
-                disabled=True,
-            )
+        # No additional settings in col2 for now
 
     # Generate button
     generate_button = st.button("Generate", type="primary", use_container_width=True)
@@ -241,7 +245,7 @@ def main():
         else:
             # Validate parameters
             params_valid, params_error = validate_generation_params(
-                max_length, temperature, top_k, top_p
+                max_length, temperature
             )
             if not params_valid:
                 st.error(params_error)
@@ -264,8 +268,7 @@ def main():
                             st.session_state.device,
                             max_length=max_length,
                             temperature=temperature,
-                            top_k=top_k,
-                            top_p=top_p,
+                            allowed_programs=instrument_programs,
                         )
 
                         progress_bar.progress(60)

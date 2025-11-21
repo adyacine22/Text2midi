@@ -19,16 +19,30 @@ def midi_to_wav(midi_path, wav_path, soundfont_path=None):
         bool: True if conversion successful, False otherwise
     """
     try:
-        # Default soundfont path
-        if soundfont_path is None:
+        # Resolve soundfont path
+        if soundfont_path is not None:
+            soundfont_path = Path(soundfont_path)
+        else:
             root_dir = Path(__file__).parent.parent.parent
-            soundfont_path = root_dir / "soundfont" / "FluidR3_GM.sf2"
+            soundfont_dir = root_dir / "soundfont"
 
-        if not os.path.exists(soundfont_path):
+            # Pick the first .sf2 file found in the directory (if any)
+            if soundfont_dir.exists():
+                sf2_files = list(soundfont_dir.glob("*.sf2"))
+                if sf2_files:
+                    soundfont_path = sf2_files[0]
+
+        # If we still don't have a valid soundfont path, abort with a warning
+        if soundfont_path is None or not soundfont_path.exists():
+            root_dir = Path(__file__).parent.parent.parent
+            soundfont_dir = root_dir / "soundfont"
             st.warning(
-                f"Soundfont not found at {soundfont_path}. Audio conversion skipped."
+                f"No .sf2 soundfont found. "
+                f"Place a soundfont file in {soundfont_dir} to enable audio preview."
             )
             return False
+
+        soundfont_path = str(soundfont_path)
 
         # FluidSynth command
         cmd = [

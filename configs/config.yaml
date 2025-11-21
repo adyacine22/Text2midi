@@ -18,11 +18,11 @@ training:
     learning_rate: 0.000001
     weight_decay: 0.01
     gradient_accumulation_steps: 4
-    with_tracking: False  # Set to True if using wandb
+    with_tracking: True  # Enable TensorBoard logging
     checkpointing_steps: epoch
-    report_to: wandb
+    report_to: tensorboard
     output_dir: ./output  # Changed to relative path
-    per_device_train_batch_size: 32
+    per_device_train_batch_size: 4
     use_scheduler: True
     lr_scheduler_type: cosine #choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
     num_warmup_steps: 100
@@ -34,7 +34,7 @@ training:
     k: -0.312
 
 raw_data:
-  caption_dataset_path: ./captions/captions.json  # Changed to relative path
+  caption_dataset_path: ./captions/all_captions.json  # Unified MidiCaps + SymphonyNet
   raw_data_folders: 
     lmd: 
       folder_path: ./data/lakhmidi  # Changed to relative path (optional, only if you have this data)

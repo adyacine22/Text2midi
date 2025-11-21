@@ -364,5 +364,7 @@ xxhash==3.5.0
 yarl==1.18.3
     # via aiohttp
 
+tensorboard==2.16.2
+
 # The following packages are considered to be unsafe in a requirements file:
 # setuptools

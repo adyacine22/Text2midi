@@ -16,8 +16,7 @@ def generate_midi_from_prompt(
     device,
     max_length=1000,
     temperature=1.0,
-    top_k=0,
-    top_p=0.0,
+    allowed_programs=None,
 ):
     """
     Generate MIDI from text prompt
@@ -30,8 +29,8 @@ def generate_midi_from_prompt(
         device: Device to run inference on
         max_length: Maximum sequence length
         temperature: Sampling temperature
-        top_k: Top-k sampling (0 = disabled)
-        top_p: Nucleus sampling (0.0 = disabled)
+        allowed_programs: Optional list of allowed MIDI program numbers (0–127).
+            If None or empty, all instruments are allowed.
 
     Returns:
         tuple: (midi_object, generation_time, num_tokens)
@@ -53,6 +52,20 @@ def generate_midi_from_prompt(
             [inputs.attention_mask.squeeze(0)], batch_first=True, padding_value=0
         ).to(device)
 
+        # Build forbidden token id list based on allowed programs, if any
+        forbidden_token_ids = None
+        if allowed_programs:
+            vocab = remi_tokenizer.vocab
+            forbidden_token_ids = []
+            for token, idx in vocab.items():
+                if token.startswith("Program_"):
+                    try:
+                        prog_num = int(token.split("_", 1)[1])
+                    except ValueError:
+                        continue
+                    if prog_num not in allowed_programs:
+                        forbidden_token_ids.append(idx)
+
         # Generate MIDI tokens
         with torch.no_grad():
             output = model.generate(
@@ -60,6 +73,7 @@ def generate_midi_from_prompt(
                 attention_mask,
                 max_len=max_length,
                 temperature=temperature,
+                forbidden_token_ids=forbidden_token_ids,
             )
 
         # Decode to MIDI
