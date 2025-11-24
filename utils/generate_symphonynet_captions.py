@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data.instruments_mapping import INSTRUMENT_CLASSES
+from data.instruments_mapping import INSTRUMENT_CLASSES, INSTRUMENTS
 
 
 # ---------- Music analysis helpers ----------
@@ -53,7 +53,15 @@ def tempo_word(bpm: float) -> str:
     return "very fast"
 
 
+def program_to_name(program: int, is_drum: bool) -> str:
+    """Convert MIDI program number to instrument name."""
+    if is_drum:
+        return INSTRUMENTS.get(-1, "Drums")
+    return INSTRUMENTS.get(program, f"Program {program}")
+
+
 def program_to_classes(program: int, is_drum: bool) -> List[str]:
+    """Get instrument class for a program (for metadata)."""
     if is_drum:
         return ["Drums / Percussion"]
     classes = []
@@ -77,12 +85,16 @@ def analyze_midi(path: Path) -> Dict:
     score = Score(str(path))
     pcs: List[int] = []
     classes_set: Set[str] = set()
+    programs_set: Set[str] = set()  # NEW: Track specific instrument programs
+    
     for tr in score.tracks:
         if tr.is_drum:
             classes_set.update(program_to_classes(-1, True))
+            programs_set.add("Drums")
         else:
             classes_set.update(program_to_classes(tr.program, False))
-        # calculation of track instrument programs:
+            programs_set.add(program_to_name(tr.program, False))  # NEW: Add program name
+        
         for note in tr.notes:
             pcs.append(note.pitch)
 
@@ -95,7 +107,8 @@ def analyze_midi(path: Path) -> Dict:
         "key": key,
         "tempo": tempo_val,
         "time_signature": time_sig,
-        "instrument_classes": sorted(classes_set),
+        "instrument_classes": sorted(classes_set),  # Keep for metadata
+        "instrument_programs": sorted(programs_set),  # NEW: Specific instruments for caption
         "adjectives_tracks": number_of_tracks_to_adjective(len(score.tracks)),
     }
 
@@ -149,7 +162,8 @@ def pick_phrase(choices: List[str], **kwargs) -> str:
 
 
 def caption_from_meta(meta: Dict) -> str:
-    instruments = ", ".join(meta["instrument_classes"]) or "varied orchestral sections"
+    # Use specific instrument programs instead of classes
+    instruments = ", ".join(meta["instrument_programs"]) or "varied orchestral sections"
     return " ".join(
             
 

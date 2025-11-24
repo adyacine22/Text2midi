@@ -73,6 +73,7 @@ def load_text2midi_model():
             use_moe,
             num_experts,
             device=device,
+            tokenizer=remi_tokenizer,
         )
 
         # Load weights

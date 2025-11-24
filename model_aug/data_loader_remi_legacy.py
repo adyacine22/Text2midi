@@ -17,11 +17,26 @@ from spacy.lang.en import English
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.dirname(SCRIPT_DIR))
+try:
+    from utils.instruments_mapping import INSTRUMENT_CLASSES
+except ModuleNotFoundError:
+    # Fallback when running as a module
+    from .utils.instruments_mapping import INSTRUMENT_CLASSES
 
 
 class Text2MusicDataset(Dataset):
     def __init__(self, configs, captions, remi_tokenizer, mode="train", shuffle=False):
         self.mode = mode
+        self.use_instrument_conditioning = configs["model"]["text2midi_model"].get(
+            "use_instrument_conditioning", False
+        )
+        instrument_vocab = configs["model"]["text2midi_model"].get(
+            "instrument_classes", list(INSTRUMENT_CLASSES.keys())
+        )
+        self.instrument_class_to_id = {
+            name.lower(): idx for idx, name in enumerate(instrument_vocab)
+        }
+        self.no_instr_token_id = len(self.instrument_class_to_id)
         # Optional split filtering if captions include a "split" field
         split_filter = None
         if any("split" in c for c in captions):
@@ -100,6 +115,11 @@ class Text2MusicDataset(Dataset):
             if base is None:
                 base = self.default_dataset_path
             midi_filepath = os.path.join(base, location)
+        
+        if not os.path.exists(midi_filepath):
+            # This can happen if the dataset is not fully available locally.
+            # print(f"Warning: MIDI file not found, skipping: {midi_filepath}")
+            return None
         # print(f'midi filepath: {midi_filepath}')
         # Read the MIDI file
         tokens = self.remi_tokenizer(midi_filepath)
@@ -161,7 +181,31 @@ class Text2MusicDataset(Dataset):
                 tokenized_midi[0 : self.decoder_max_sequence_length]
             ).to(torch.int64)
 
-        return input_ids, attention_mask, labels
+        inst_ids = torch.tensor([self.no_instr_token_id], dtype=torch.long)
+        inst_mask = torch.tensor([0], dtype=torch.long)
+        if self.use_instrument_conditioning:
+            raw_inst = (
+                self.captions[idx].get("instrument_classes")
+                or self.captions[idx].get("instruments")
+            )
+            inst_list = []
+            if isinstance(raw_inst, str):
+                inst_list = [s.strip().lower() for s in raw_inst.split(",") if s]
+            elif isinstance(raw_inst, (list, tuple)):
+                inst_list = [str(s).strip().lower() for s in raw_inst if s]
+            inst_ids_list = [
+                self.instrument_class_to_id.get(name)
+                for name in inst_list
+                if name in self.instrument_class_to_id
+            ]
+            if inst_ids_list:
+                inst_ids = torch.tensor(inst_ids_list, dtype=torch.long)
+                inst_mask = torch.ones_like(inst_ids, dtype=torch.long)
+            else:
+                inst_ids = torch.tensor([self.no_instr_token_id], dtype=torch.long)
+                inst_mask = torch.tensor([0], dtype=torch.long)
+
+        return input_ids, attention_mask, labels, inst_ids, inst_mask
 
 
 if __name__ == "__main__":
@@ -179,7 +223,8 @@ if __name__ == "__main__":
     with open(args.config, "r") as f:
         configs = yaml.safe_load(f)
 
-    tokenizer_filepath = os.path.join(configs["artifact_folder"], "vocab_remi.pkl")
+    tokenizer_filename = configs.get("tokenizer_file", "vocab_remi_z.pkl")
+    tokenizer_filepath = os.path.join(configs["artifact_folder"], tokenizer_filename)
     # Load the tokenizer dictionary
     with open(tokenizer_filepath, "rb") as f:
         tokenizer = pickle.load(f)

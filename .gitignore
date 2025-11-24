@@ -168,7 +168,10 @@ cython_debug/
 #.idea/
 
 output/
-
+checkpoint*/
 captions/
+evaluation_midi_json/
+
+
 
 

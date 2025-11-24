@@ -7,45 +7,60 @@ from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-soundfont_filepath = os.path.join(BASE_DIR, "soundfont", "FluidR3_GM.sf2")
-soundfont_zip_url = "https://keymusician01.s3.amazonaws.com/FluidR3_GM.zip"
-midi_root = os.path.join(BASE_DIR, "generated_midi")
-wav_root = os.path.join(BASE_DIR, "wav")
+def get_soundfont(soundfont_dir):
+    """Finds the first .sf2 file in the given directory."""
+    if not os.path.exists(soundfont_dir):
+        return None
+    for file in os.listdir(soundfont_dir):
+        if file.lower().endswith(".sf2"):
+            return os.path.join(soundfont_dir, file)
+    return None
 
 
-def download_and_extract_soundfont():
-    if os.path.isfile(soundfont_filepath):
+def download_and_extract_soundfont(target_dir=None):
+    if target_dir is None:
+        target_dir = os.path.join(BASE_DIR, "soundfont")
+    
+    soundfont_filepath = get_soundfont(target_dir)
+    if soundfont_filepath:
         print(f"✓ SoundFont already exists: {soundfont_filepath}")
-        return
+        return soundfont_filepath
 
-    print("📥 Downloading SoundFont...")
-    os.makedirs(os.path.dirname(soundfont_filepath), exist_ok=True)
+    print(f"📥 Downloading SoundFont to {target_dir}...")
+    os.makedirs(target_dir, exist_ok=True)
 
     response = requests.get(soundfont_zip_url, stream=True)
     total_size = int(response.headers.get("content-length", 0))
 
-    downloaded = 0
     content = b""
-
     with tqdm(total=total_size, unit="B", unit_scale=True, desc="Downloading") as pbar:
         for chunk in response.iter_content(chunk_size=8192):
             if chunk:
                 content += chunk
-                downloaded += len(chunk)
                 pbar.update(len(chunk))
 
     print("📦 Extracting SoundFont...")
     with zipfile.ZipFile(BytesIO(content)) as z:
         sf2_file = next(name for name in z.namelist() if name.lower().endswith(".sf2"))
-        with z.open(sf2_file) as src, open(soundfont_filepath, "wb") as dst:
-            dst.write(src.read())
+        # Extract to target_dir
+        z.extract(sf2_file, target_dir)
+        soundfont_filepath = os.path.join(target_dir, sf2_file)
 
     print(f"✓ SoundFont ready: {soundfont_filepath}")
+    return soundfont_filepath
 
 
-def save_wav(midi_filepath, wav_filepath):
+def save_wav(midi_filepath, wav_filepath, soundfont_path=None):
     if os.path.isfile(wav_filepath):
         return wav_filepath
+
+    if soundfont_path is None:
+        # Fallback to default location search
+        default_dir = os.path.join(BASE_DIR, "soundfont")
+        soundfont_path = get_soundfont(default_dir)
+        if soundfont_path is None:
+            print("❌ No SoundFont found. Please provide soundfont_path or download it.")
+            return None
 
     try:
         subprocess.run(
@@ -53,7 +68,7 @@ def save_wav(midi_filepath, wav_filepath):
                 "fluidsynth",
                 "-r",
                 "48000",
-                soundfont_filepath,
+                soundfont_path,
                 "-g",
                 "1.0",
                 "--quiet",
@@ -73,12 +88,13 @@ def save_wav(midi_filepath, wav_filepath):
     return wav_filepath
 
 
-def process_midi_file(midi_filepath):
+def process_midi_file(args):
+    midi_filepath, soundfont_path = args
     wav_filepath = os.path.join(
         wav_root, os.path.basename(midi_filepath).replace(".mid", ".wav")
     )
     os.makedirs(wav_root, exist_ok=True)
-    save_wav(midi_filepath, wav_filepath)
+    save_wav(midi_filepath, wav_filepath, soundfont_path)
 
 
 def main():

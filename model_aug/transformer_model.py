@@ -1,8 +1,9 @@
-# from aria.tokenizer import AbsTokenizer
+
 # aria_tokenizer = AbsTokenizer()
 import copy
 import json
-from typing import Optional, Any, Union, Callable, Iterable
+from types import SimpleNamespace
+from typing import Optional, Any, Union, Callable, Iterable, List
 import torch.multiprocessing as mp
 from torch.nn import DataParallel
 import jsonlines
@@ -11,7 +12,7 @@ import time
 import torch
 import os
 import warnings
-from tqdm import tqdm
+from tqdm import tqdm   
 from torch import Tensor
 
 # from aria.tokenizer import AbsTokenizer
@@ -40,6 +41,8 @@ import torch.profiler
 
 from accelerate import Accelerator
 import argparse  # Add this import
+
+from utils.instruments_mapping import INSTRUMENT_CLASSES
 
 
 class CaptionDataset(Dataset):
@@ -152,21 +155,138 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class InstrumentEncoder(nn.Module):
+    """Lightweight encoder for instrument control tokens."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        factory_kwargs = {"device": device}
+        self.embed = nn.Embedding(vocab_size, d_model, **factory_kwargs)
+
+    def forward(self, inst_ids: Tensor) -> Tensor:
+        """Just embed the instrument IDs.
+        The output shape will be (batch_size, num_instruments, d_model).
+        """
+        return self.embed(inst_ids)
+
+
+class SimpleTokenTypeGating(nn.Module):
+    """Token-type aware gating for blending text and instrument attention."""
+
+    def __init__(self, d_model: int, device: torch.device | None = None):
+        super().__init__()
+        factory_kwargs = {"device": device}
+        initial_weights = torch.tensor(
+            [
+                [0.35, 0.65],  # instrument tokens lean on instrument memory
+                [0.9, 0.1],  # onset tokens use textual cues
+                [0.55, 0.45],  # pitch tokens still leverage instruments
+                [0.6, 0.4],  # duration tokens modestly prefer text
+                [0.5, 0.5],  # bar tokens balanced
+                [0.6, 0.4],  # fallback for other tokens
+            ],
+            **factory_kwargs,
+        )
+        self.weights = nn.Parameter(initial_weights)
+
+    def forward(
+        self,
+        text_out: Tensor,
+        inst_out: Tensor,
+        token_types: Optional[Tensor],
+    ) -> Tensor:
+        if token_types is None:
+            return text_out + inst_out
+
+        weights = self.weights.to(text_out.dtype)
+        selected = weights[token_types]  # (batch, seq, 2)
+        selected = selected / selected.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        fused = selected[..., 0:1] * text_out + selected[..., 1:2] * inst_out
+        return fused
+
+
+class InstrumentAwareOutputProjection(nn.Module):
+    """Output projection that injects instrument-class priors."""
+
+    def __init__(
+        self,
+        d_model: int,
+        vocab_size: int,
+        num_classes: int = 17,
+        instrument_token_count: Optional[int] = None,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        factory_kwargs = {"device": device}
+        self.base_proj = nn.Linear(d_model, vocab_size, **factory_kwargs)
+        token_count = instrument_token_count if instrument_token_count and instrument_token_count > 0 else 1
+        self.class_program_bias = nn.Parameter(
+            torch.zeros(num_classes, token_count, **factory_kwargs)
+        )
+        self.inst_token_start: Optional[int] = None
+        self.inst_token_end: Optional[int] = None
+
+    def _apply_class_bias(
+        self,
+        logits: Tensor,
+        active_classes: Optional[Tensor],
+        token_types: Optional[Tensor],
+    ) -> Tensor:
+        if (
+            active_classes is None
+            or token_types is None
+            or self.inst_token_start is None
+            or self.inst_token_end is None
+        ):
+            return logits
+
+        is_inst_token = token_types == 0
+        if not torch.any(is_inst_token):
+            return logits
+
+        class_bias = torch.matmul(
+            active_classes.float(), self.class_program_bias
+        )  # (batch, 129)
+        inst_slice = slice(self.inst_token_start, self.inst_token_end)
+        bias = class_bias.unsqueeze(1).to(logits.dtype)
+        mask = is_inst_token.unsqueeze(-1).to(logits.dtype)
+        logits[:, :, inst_slice] = logits[:, :, inst_slice] + bias * mask
+        return logits
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        active_classes: Optional[Tensor] = None,
+        token_types: Optional[Tensor] = None,
+    ) -> Tensor:
+        logits = self.base_proj(hidden_states)
+        return self._apply_class_bias(logits, active_classes, token_types)
+
+
 def precompute_freqs_cis(
     seq_len: int,
     n_elem: int,
     base: int = 10000,
     dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | str | None = None,
 ):
+    if device is None:
+        device = "cpu"
     freqs = 1.0 / (
-        base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
+        base ** (torch.arange(0, n_elem, 2, device=device).float() / n_elem)
     )
-    t = torch.arange(seq_len, device=freqs.device)
+    t = torch.arange(seq_len, device=device)
     freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs, device=device), freqs)
     cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
 
-    return cache.to(dtype=dtype)
+    return cache.to(dtype=dtype, device=device)
 
 
 @torch.jit.script
@@ -221,6 +341,7 @@ class MultiHeadSelfAttention(nn.Module):
         batch_first: bool = True,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        use_flash_attn: bool = True,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -233,6 +354,17 @@ class MultiHeadSelfAttention(nn.Module):
         self.to_qkv = nn.Linear(embed_dim, hidden_dim * 3, bias=False, **factory_kwargs)
         self.to_out = nn.Linear(hidden_dim, embed_dim, bias=False, **factory_kwargs)
         self.dropout = nn.Dropout(dropout)
+        self.use_flash_attn = use_flash_attn
+
+    def _should_use_flash_attn(self, x: torch.Tensor) -> bool:
+        # FlashAttention requires CUDA, a supported head dimension, and half/bfloat precision
+        return (
+            self.use_flash_attn
+            and x.is_cuda
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and self.dim_head % 8 == 0
+            and self.dim_head <= 128
+        )
 
     def forward(self, x: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
         r"""Forward pass of the multi-head self-attention module.
@@ -250,18 +382,28 @@ class MultiHeadSelfAttention(nn.Module):
         q, k, v = torch.chunk(self.to_qkv(x), chunks=3, dim=-1)
         q, k, v = map(lambda t: t.contiguous().view(b, self.heads, n, -1), (q, k, v))
 
-        self.freqs_cis = precompute_freqs_cis(
+        freqs_cis = precompute_freqs_cis(
             seq_len=n,
             n_elem=self.embed_dim // self.heads,
             base=10000,
             dtype=x.dtype,
-        ).to(x.device)
-        freqs_cis = self.freqs_cis[: x.shape[1]]
-        # q = apply_rotary_emb(q, freqs_cis)
-        # k = apply_rotary_emb(k, freqs_cis)
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=is_causal
-        )
+            device=x.device,
+        )[: x.shape[1]]
+        q = apply_rotary_emb(q, freqs_cis)
+        k = apply_rotary_emb(k, freqs_cis)
+        if self._should_use_flash_attn(x):
+            # Prefer PyTorch’s built-in flash attention kernel where available.
+            # Disable other kernels to steer the dispatcher.
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=True, enable_math=False, enable_mem_efficient=False
+            ):
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=is_causal
+                )
+        else:
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=is_causal
+            )
         out = out.contiguous().view(b, n, -1)
         out = self.dropout(out)
         return self.to_out(out)
@@ -322,23 +464,34 @@ class Transformer(Module):
         batch_first: bool = True,
         norm_first: bool = False,
         bias: bool = True,
+        use_flash_attn: bool = True,
         device=None,
         dtype=None,
+        instrument_vocab_size: int = 129,
+        text_encoder: Optional[nn.Module] = None,
+        use_instrument_conditioning: bool = True,
+        no_instr_token_id: Optional[int] = None,
+        tokenizer: Optional[Any] = None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
 
         self.use_moe = use_moe
+        self.use_flash_attn = use_flash_attn
 
         self.input_emb = nn.Embedding(n_vocab, d_model, **factory_kwargs)
         self.pos_encoder = PositionalEncoding(d_model, dropout, max_len).to(device)
 
-        # Load the FLAN-T5 encoder
-        self.encoder = T5EncoderModel.from_pretrained("google/flan-t5-base").to(device)
-        # Freeze the encoder
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+        # Load or inject the text encoder (T5 by default)
+        if text_encoder is None:
+            self.encoder = T5EncoderModel.from_pretrained(
+                "google/flan-t5-base"
+            ).to(device)
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+        else:
+            self.encoder = text_encoder.to(device)
 
         decoder_layer = TransformerDecoderLayer(
             d_model,
@@ -352,6 +505,7 @@ class Transformer(Module):
             batch_first,
             norm_first,
             bias,
+            self.use_flash_attn,
             **factory_kwargs,
         )
         decoder_norm = LayerNorm(
@@ -361,7 +515,43 @@ class Transformer(Module):
             decoder_layer, num_decoder_layers, use_moe, decoder_norm
         )
 
-        self.projection = nn.Linear(d_model, n_vocab).to(device)
+        self.use_instrument_conditioning = use_instrument_conditioning
+        self.no_instr_token_id = (
+            instrument_vocab_size if no_instr_token_id is None else no_instr_token_id
+        )
+        if use_instrument_conditioning:
+            self.instrument_encoder = InstrumentEncoder(
+                vocab_size=instrument_vocab_size + 1,
+                d_model=d_model,
+                device=device,
+            )
+
+        inst_range = self._infer_instrument_token_range(tokenizer)
+        instrument_token_count = (
+            inst_range[1] - inst_range[0] if inst_range is not None else None
+        )
+
+        self.num_instrument_classes = instrument_vocab_size
+        self.tokenizer = tokenizer  # Store tokenizer for constrained decoding
+        self.projection = InstrumentAwareOutputProjection(
+            d_model=d_model,
+            vocab_size=n_vocab,
+            num_classes=max(1, instrument_vocab_size),
+            instrument_token_count=instrument_token_count,
+            device=device,
+        )
+        if inst_range is not None:
+            (
+                self.projection.inst_token_start,
+                self.projection.inst_token_end,
+            ) = inst_range
+
+        token_type_lookup = self._build_token_type_lookup(
+            tokenizer, n_vocab, device=device
+        )
+        self.register_buffer(
+            "token_type_lookup", token_type_lookup, persistent=False
+        )
 
         self._reset_parameters()
 
@@ -375,6 +565,8 @@ class Transformer(Module):
         src: Tensor,
         src_mask: Tensor,
         tgt: Tensor,
+        inst: Optional[Tensor] = None,
+        inst_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         tgt_is_causal: bool = True,
@@ -450,19 +642,44 @@ class Transformer(Module):
         if src.dim() != tgt.dim():
             raise RuntimeError("the number of dimensions in src and tgt must be equal")
 
-        memory = self.encoder(src, attention_mask=src_mask).last_hidden_state
+        encoder_out = self.encoder(src, attention_mask=src_mask)
+        memory = (
+            encoder_out.last_hidden_state
+            if hasattr(encoder_out, "last_hidden_state")
+            else encoder_out
+        )
 
+        inst_memory = None
+        inst_key_padding_mask = None
+        if self.use_instrument_conditioning and inst is not None:
+            inst_memory = self.instrument_encoder(inst)
+            inst_key_padding_mask = (
+                None if inst_mask is None else torch.logical_not(inst_mask.bool())
+            )
+
+        text_key_padding_mask = (
+            None if src_mask is None else torch.logical_not(src_mask.bool())
+        )
+
+        token_types = self._token_types_from_ids(tgt)
         tgt = self.input_emb(tgt) * math.sqrt(self.d_model)
-        tgt = self.pos_encoder(tgt)
-        # tgt = tgt + tgt_pos
+        # Positional encoding is now handled by RoPE in attention
+        # tgt = self.pos_encoder(tgt)
+
+        active_classes = self._compute_active_class_mask(inst, inst_mask)
 
         if self.use_moe:
             with torch.cuda.amp.autocast(enabled=False):
                 output, sum_total_aux_loss = self.decoder(
                     tgt,
                     memory,
+                    inst_memory=inst_memory,
+                    token_types=token_types,
                     memory_mask=memory_mask,
-                    memory_key_padding_mask=memory_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask
+                    if memory_key_padding_mask is not None
+                    else text_key_padding_mask,
+                    inst_key_padding_mask=inst_key_padding_mask,
                     tgt_is_causal=tgt_is_causal,
                     memory_is_causal=memory_is_causal,
                 )
@@ -470,19 +687,230 @@ class Transformer(Module):
             output = self.decoder(
                 tgt,
                 memory,
+                inst_memory=inst_memory,
+                token_types=token_types,
                 memory_mask=memory_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask
+                if memory_key_padding_mask is not None
+                else text_key_padding_mask,
+                inst_key_padding_mask=inst_key_padding_mask,
                 tgt_is_causal=tgt_is_causal,
                 memory_is_causal=memory_is_causal,
             )
 
-        output = self.projection(output)
+        output = self.projection(
+            hidden_states=output,
+            active_classes=active_classes,
+            token_types=token_types,
+        )
         # output = F.log_softmax(output, dim=-1)
 
         if self.use_moe:
             return output, sum_total_aux_loss
         else:
             return output
+
+    def _get_valid_instrument_programs(self, inst_ids: Optional[Tensor]) -> Optional[Union[List[int], Tensor]]:
+        """Map instrument class IDs to valid MIDI program numbers per sample.
+        
+        Returns:
+            Boolean Tensor of shape (batch_size, 129) where True means allowed.
+            Index 0-127 are MIDI programs, 128 is Drums.
+            Returns None if no restrictions.
+        """
+        if inst_ids is None:
+            return None
+        
+        # Import instrument class mapping
+        try:
+            from utils.instruments_mapping import INSTRUMENT_CLASSES
+        except ImportError:
+            try:
+                from ..utils.instruments_mapping import INSTRUMENT_CLASSES
+            except ImportError:
+                return None  # Fallback: allow all instruments
+        
+        batch_size = inst_ids.size(0)
+        # Create mask: (batch_size, 129)
+        program_mask = torch.zeros((batch_size, 129), dtype=torch.bool, device=inst_ids.device)
+        
+        class_names = list(INSTRUMENT_CLASSES.keys())
+        
+        # Iterate over batch
+        for i in range(batch_size):
+            # Get classes for this sample
+            sample_classes = inst_ids[i]
+            sample_classes = sample_classes[sample_classes != self.no_instr_token_id]
+            
+            if len(sample_classes) == 0:
+                # If no classes specified, allow all
+                program_mask[i, :] = True 
+                continue
+                
+            for class_id in sample_classes:
+                class_id_int = int(class_id.item())
+                if 0 <= class_id_int < len(class_names):
+                    class_name = class_names[class_id_int]
+                    programs = INSTRUMENT_CLASSES[class_name]
+                    for p in programs:
+                        prog_idx = 128 if p == -1 else p
+                        if 0 <= prog_idx <= 128:
+                            program_mask[i, prog_idx] = True
+                            
+        return program_mask
+
+    def _apply_structural_mask(
+        self,
+        logits: Tensor,
+        current_state: str,
+        valid_programs: Optional[Union[List[int], Tensor]],
+        tokenizer: Any,
+    ) -> Tensor:
+        """Apply structural constraints based on REMI-z grammar.
+        
+        Args:
+            logits: Output logits (batch_size, vocab_size)
+            current_state: Current generation state
+            valid_programs: List of valid MIDI programs, or Tensor mask (batch_size, 129), or None
+            tokenizer: Tokenizer with id_to_token mapping
+        
+        Returns:
+            Masked logits with invalid tokens set to -inf
+        """
+        vocab_size = logits.size(-1)
+        mask = torch.zeros(vocab_size, dtype=torch.bool, device=logits.device)
+        
+        # Get token mappings
+        id_to_token = getattr(tokenizer, "id_to_token", {})
+        
+        # Always mask out special tokens (PAD, BOS, EOS, MASK) except EOS in AFTER_BAR state
+        for tok_id, tok_str in id_to_token.items():
+            if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
+                token = str(tok_str)
+                if token in ["PAD_None", "BOS_None", "MASK_None"]:
+                    # These should never be generated
+                    pass  # Leave mask[tok_id] = False
+        
+        # Define which token types are allowed in each state
+        if current_state == "START_BAR":
+            # Only instrument tokens allowed
+            for tok_id, tok_str in id_to_token.items():
+                if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
+                    token = str(tok_str)
+                    if token.startswith("i-"):
+                        # Check if this instrument is in valid_programs
+                        if valid_programs is not None:
+                            try:
+                                program = int(token.split("-")[1])
+                                if isinstance(valid_programs, list):
+                                    if program in valid_programs:
+                                        mask[tok_id] = True
+                                elif isinstance(valid_programs, torch.Tensor):
+                                    # Allow in base mask, filter later per sample
+                                    mask[tok_id] = True
+                            except (ValueError, IndexError):
+                                pass
+                        else:
+                            mask[tok_id] = True
+        
+        elif current_state == "AFTER_INSTRUMENT":
+            # Only onset tokens allowed
+            for tok_id, tok_str in id_to_token.items():
+                if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
+                    if str(tok_str).startswith("o-"):
+                        mask[tok_id] = True
+        
+        elif current_state == "AFTER_ONSET":
+            # Only pitch tokens allowed
+            for tok_id, tok_str in id_to_token.items():
+                if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
+                    if str(tok_str).startswith("p-"):
+                        mask[tok_id] = True
+        
+        elif current_state == "AFTER_PITCH":
+            # Only duration tokens allowed
+            for tok_id, tok_str in id_to_token.items():
+                if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
+                    if str(tok_str).startswith("d-"):
+                        mask[tok_id] = True
+        
+        elif current_state == "AFTER_DURATION":
+            # Can generate onset (next note), instrument (new track in same bar), or bar marker (end bar)
+            for tok_id, tok_str in id_to_token.items():
+                if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
+                    token = str(tok_str)
+                    if token.startswith("o-") or token.startswith("b-"):
+                        mask[tok_id] = True
+                    elif token.startswith("i-"):
+                        # Allow new instrument in same bar
+                        if valid_programs is not None:
+                            try:
+                                program = int(token.split("-")[1])
+                                if isinstance(valid_programs, list):
+                                    if program in valid_programs:
+                                        mask[tok_id] = True
+                                elif isinstance(valid_programs, torch.Tensor):
+                                    # Allow in base mask, filter later per sample
+                                    mask[tok_id] = True
+                            except (ValueError, IndexError):
+                                pass
+                        else:
+                            mask[tok_id] = True
+        
+        elif current_state == "AFTER_BAR":
+            # Can generate instrument (new track) or EOS (end sequence)
+            for tok_id, tok_str in id_to_token.items():
+                if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
+                    token = str(tok_str)
+                    if token.startswith("i-"):
+                        # Check if this instrument is in valid_programs
+                        if valid_programs is not None:
+                            try:
+                                program = int(token.split("-")[1])
+                                if isinstance(valid_programs, list):
+                                    if program in valid_programs:
+                                        mask[tok_id] = True
+                                elif isinstance(valid_programs, torch.Tensor):
+                                    # Allow in base mask, filter later per sample
+                                    mask[tok_id] = True
+                            except (ValueError, IndexError):
+                                pass
+                        else:
+                            mask[tok_id] = True
+                    elif token == "EOS_None":
+                        mask[tok_id] = True
+        
+        # Apply mask: set invalid tokens to -inf
+        # Broadcast mask to match batch dimension if needed
+        logits_masked = logits.clone()
+        if logits.dim() == 2:  # (batch_size, vocab_size)
+            batch_size = logits.size(0)
+            # Expand mask to (batch_size, vocab_size)
+            mask_expanded = mask.unsqueeze(0).expand(batch_size, -1).clone()
+            
+            # Apply per-sample instrument constraints if valid_programs is a Tensor
+            if isinstance(valid_programs, torch.Tensor) and (current_state in ["START_BAR", "AFTER_DURATION", "AFTER_BAR"]):
+                 # Iterate over instrument tokens and refine mask
+                 # This is slightly inefficient but safe. 
+                 # Optimization: Pre-compute instrument token IDs if this is too slow.
+                 for tok_id, tok_str in id_to_token.items():
+                     if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
+                         token = str(tok_str)
+                         if token.startswith("i-"):
+                             try:
+                                 program = int(token.split("-")[1])
+                                 # valid_programs[:, program] is (batch_size,)
+                                 # mask_expanded[:, tok_id] should be ANDed with this
+                                 if mask[tok_id]: # Only if allowed by state
+                                     mask_expanded[:, tok_id] = mask_expanded[:, tok_id] & valid_programs[:, program]
+                             except (ValueError, IndexError):
+                                 pass
+            
+            logits_masked[~mask_expanded] = float("-inf")
+        else:  # (vocab_size,)
+            logits_masked[~mask] = float("-inf")
+        
+        return logits_masked
 
     def generate(
         self,
@@ -491,6 +919,8 @@ class Transformer(Module):
         max_len: int = 100,
         temperature: float = 1.0,
         forbidden_token_ids: Optional[Iterable[int]] = None,
+        inst: Optional[Tensor] = None,
+        inst_mask: Optional[Tensor] = None,
     ):
         ## ADD A START OF SEQUENCE TOKEN  <SS> token to the src tensor
         r"""Generate a sequence of tokens from the given inputs.
@@ -501,6 +931,8 @@ class Transformer(Module):
             max_len: the maximum length of the sequence to generate (default=100).
             temperature: the temperature for the softmax (default=1.0).
             forbidden_token_ids: Optional iterable of token ids that should never be sampled.
+            inst: Optional instrument instruction ids (batch, seq).
+            inst_mask: Optional attention mask (batch, seq) for instruments.
 
         Returns:
             torch.Tensor: The generated sequence of tokens.
@@ -508,19 +940,38 @@ class Transformer(Module):
         """
         if src.dim() != 2:
             raise RuntimeError("The src tensor should be 2-dimensional")
+
+        if self.use_instrument_conditioning:
+            if inst is None:
+                inst = torch.full(
+                    (src.size(0), 1),
+                    self.no_instr_token_id,
+                    dtype=torch.long,
+                    device=src.device,
+                )
+            if inst_mask is None:
+                inst_mask = torch.ones_like(inst)
+
         tgt_fin = torch.full((src.size(0), 1), 1, dtype=torch.long, device=src.device)
-        # values = [21631, 8, 10, 9, 6, 7, 17, 21632, 11474, 20626, 21151, 9426, 20627, 21143, 11476, 20640, 21143, 11477, 20655, 21145, 11476, 20669, 21145, 11477, 20683, 21145, 13527, 20697, 21146, 13529, 20712, 21145, 7013, 20769, 21143, 7006, 20769, 21143, 7006, 20769, 21141, 7009, 20769, 21143, 9426, 20797, 21144, 11474, 20797, 21173, 11476, 20812, 21144, 11477, 20826, 21145, 11476, 20840, 21145, 11477, 20855, 21145, 13527, 20869, 21144, 13529, 20883, 21143, 7006, 20940, 21139, 7013, 20940, 21140, 7006, 20940, 21147, 7009, 20940, 21147, 11474, 20969, 21144, 11474, 20969, 21170, 11476, 20983, 21144, 11477, 20997, 21145, 11476, 21012, 21144, 11477, 21026, 21144, 11479, 21040]
-        # values_tensor = torch.tensor(values, dtype=torch.long, device=src.device)
-        # tgt_fin = values_tensor.unsqueeze(0).repeat(src.size(0), 1)
+        
+        # Get valid instrument programs from inst_ids
+        valid_programs = self._get_valid_instrument_programs(inst)
+        
+        # Initialize state machine
+        current_state = "START_BAR"
+        
+        # Get tokenizer for masking
+        tokenizer = getattr(self, "tokenizer", None)
+        
         for i in tqdm(range(max_len)):
-            max_index = tgt_fin.max()
-            # assert max_index < 21634, "tgt_fin contains index out of range. Adjust n_vocab or fix tgt_fin indices."
             tgt = tgt_fin
             if self.use_moe:
                 output, _ = self.forward(
                     src,
                     src_mask,
                     tgt,
+                    inst=inst,
+                    inst_mask=inst_mask,
                     memory_mask=None,
                     memory_key_padding_mask=None,
                     tgt_is_causal=True,
@@ -531,21 +982,63 @@ class Transformer(Module):
                     src,
                     src_mask,
                     tgt,
+                    inst=inst,
+                    inst_mask=inst_mask,
                     memory_mask=None,
                     memory_key_padding_mask=None,
                     tgt_is_causal=True,
                     memory_is_causal=False,
                 )
-            # logits = self.projection(output)
+            
             logits = output
+            
+            # Apply forbidden tokens mask
             if forbidden_token_ids:
                 logits[..., list(forbidden_token_ids)] = float("-inf")
-            output = F.log_softmax(logits / temperature, dim=-1)
-            output = output.view(-1, output.size(-1))
-            next_tokens = torch.multinomial(torch.exp(output), 1)[
-                -1
-            ]  # taking the last logit and adding to the sequence
-            tgt_fin = torch.cat((tgt_fin, next_tokens.unsqueeze(-1)), dim=1)
+            
+            last_logits = logits[:, -1, :]
+            
+            # Apply structural mask based on current state
+            if tokenizer is not None:
+                masked_logits = self._apply_structural_mask(
+                    last_logits,
+                    current_state,
+                    valid_programs,
+                    tokenizer
+                )
+                
+                # If all logits are -inf, fall back to unmasked (safety)
+                if not torch.any(torch.isfinite(masked_logits)):
+                    pass  # Use unmasked logits
+                else:
+                    last_logits = masked_logits
+            
+            # Sample next token
+            probs = F.softmax(last_logits / temperature, dim=-1)
+            next_tokens = torch.multinomial(probs, 1)
+            
+            # Update state based on generated token
+            if tokenizer is not None:
+                next_token_id = int(next_tokens[0, 0].item())
+                next_token_str = tokenizer.id_to_token.get(next_token_id, "")
+                
+                if next_token_str.startswith("i-"):
+                    current_state = "AFTER_INSTRUMENT"
+                elif next_token_str.startswith("o-"):
+                    current_state = "AFTER_ONSET"
+                elif next_token_str.startswith("p-"):
+                    current_state = "AFTER_PITCH"
+                elif next_token_str.startswith("d-"):
+                    current_state = "AFTER_DURATION"
+                elif next_token_str.startswith("b-"):
+                    current_state = "AFTER_BAR"
+                elif next_token_str == "EOS_None":
+                    # End of sequence, break early
+                    tgt_fin = torch.cat((tgt_fin, next_tokens), dim=1)
+                    break
+            
+            tgt_fin = torch.cat((tgt_fin, next_tokens), dim=1)
+        
         return tgt_fin[:, 1:]
 
     @staticmethod
@@ -565,6 +1058,101 @@ class Transformer(Module):
         for p in self.parameters():
             if p.dim() > 1:
                 xavier_uniform_(p)
+
+    def _build_token_type_lookup(
+        self,
+        tokenizer: Optional[Any],
+        vocab_size: int,
+        device: Optional[torch.device] = None,
+    ) -> Tensor:
+        lookup = torch.full((vocab_size,), 5, dtype=torch.long)
+        if tokenizer is None:
+            return lookup.to(device) if device is not None else lookup
+
+        id_to_token = getattr(tokenizer, "id_to_token", None)
+        if not isinstance(id_to_token, dict):
+            return lookup.to(device) if device is not None else lookup
+
+        prefix_to_type = {
+            "i-": 0,
+            "o-": 1,
+            "p-": 2,
+            "d-": 3,
+            "b-": 4,
+        }
+        for tok_id, tok_str in id_to_token.items():
+            if not isinstance(tok_id, int) or tok_id >= vocab_size or tok_id < 0:
+                continue
+            token = str(tok_str)
+            token_type = 5
+            for prefix, t_type in prefix_to_type.items():
+                if token.startswith(prefix):
+                    token_type = t_type
+                    break
+            lookup[tok_id] = token_type
+
+        return lookup.to(device) if device is not None else lookup
+
+    def _infer_instrument_token_range(
+        self, tokenizer: Optional[Any]
+    ) -> Optional[tuple[int, int]]:
+        if tokenizer is None:
+            return None
+        id_to_token = getattr(tokenizer, "id_to_token", None)
+        if not isinstance(id_to_token, dict):
+            return None
+        inst_ids = [idx for idx, tok in id_to_token.items() if str(tok).startswith("i-")]
+        if not inst_ids:
+            return None
+        return min(inst_ids), max(inst_ids) + 1
+
+    def _token_types_from_ids(self, tgt: Tensor) -> Tensor:
+        lookup = getattr(self, "token_type_lookup", None)
+        if lookup is None:
+            return torch.zeros_like(tgt)
+        if lookup.device != tgt.device:
+            lookup = lookup.to(tgt.device)
+        return lookup[tgt]
+
+    def _compute_active_class_mask(
+        self,
+        inst_ids: Optional[Tensor],
+        inst_mask: Optional[Tensor],
+    ) -> Optional[Tensor]:
+        if (
+            inst_ids is None
+            or self.num_instrument_classes is None
+            or self.num_instrument_classes <= 0
+        ):
+            return None
+
+        batch_size = inst_ids.size(0)
+        mask = inst_ids != self.no_instr_token_id
+        if inst_mask is not None:
+            mask = mask & inst_mask.bool()
+
+        active = torch.zeros(
+            batch_size,
+            self.num_instrument_classes,
+            dtype=torch.float32,
+            device=inst_ids.device,
+        )
+        if not torch.any(mask):
+            return active
+
+        batch_indices = (
+            torch.arange(batch_size, device=inst_ids.device)
+            .unsqueeze(1)
+            .expand_as(inst_ids)
+        )
+        valid_batches = batch_indices[mask]
+        valid_classes = inst_ids.clamp(
+            min=0, max=self.num_instrument_classes - 1
+        )[mask]
+        updates = torch.ones_like(valid_batches, dtype=active.dtype)
+        active.index_put_((valid_batches, valid_classes), updates, accumulate=True)
+        active.clamp_(max=1.0)
+        return active
 
 
 class TransformerEncoder(Module):
@@ -819,9 +1407,13 @@ class TransformerDecoder(Module):
         self,
         tgt: Tensor,
         memory: Tensor,
+        inst_memory: Optional[Tensor] = None,
+        token_types: Optional[Tensor] = None,
         tgt_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
+        inst_mask: Optional[Tensor] = None,
+        inst_key_padding_mask: Optional[Tensor] = None,
         tgt_is_causal: Optional[bool] = None,
         memory_is_causal: bool = False,
     ) -> Tensor:
@@ -864,8 +1456,12 @@ class TransformerDecoder(Module):
                 output, total_aux_loss, balance_loss, router_z_loss = mod(
                     output,
                     memory,
+                    inst_memory=inst_memory,
+                    token_types=token_types,
                     memory_mask=memory_mask,
                     memory_key_padding_mask=memory_key_padding_mask,
+                    inst_mask=inst_mask,
+                    inst_key_padding_mask=inst_key_padding_mask,
                     tgt_is_causal=tgt_is_causal,
                     memory_is_causal=memory_is_causal,
                 )
@@ -875,8 +1471,12 @@ class TransformerDecoder(Module):
                 output = mod(
                     output,
                     memory,
+                    inst_memory=inst_memory,
+                    token_types=token_types,
                     memory_mask=memory_mask,
                     memory_key_padding_mask=memory_key_padding_mask,
+                    inst_mask=inst_mask,
+                    inst_key_padding_mask=inst_key_padding_mask,
                     tgt_is_causal=tgt_is_causal,
                     memory_is_causal=memory_is_causal,
                 )
@@ -1251,6 +1851,7 @@ class TransformerDecoderLayer(Module):
         batch_first: bool = False,
         norm_first: bool = False,
         bias: bool = True,
+        use_flash_attn: bool = True,
         device=None,
         dtype=None,
     ) -> None:
@@ -1258,7 +1859,12 @@ class TransformerDecoderLayer(Module):
         super().__init__()
 
         self.self_attn = MultiHeadSelfAttention(
-            d_model, nhead, dropout=dropout, batch_first=batch_first, **factory_kwargs
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=batch_first,
+            use_flash_attn=use_flash_attn,
+            **factory_kwargs,
         )
         self.multihead_attn = MultiheadAttention(
             d_model,
@@ -1268,6 +1874,15 @@ class TransformerDecoderLayer(Module):
             bias=bias,
             **factory_kwargs,
         )
+        self.inst_multihead_attn = MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=batch_first,
+            bias=bias,
+            **factory_kwargs,
+        )
+        self.cross_attn_gating = SimpleTokenTypeGating(d_model, device=device)
         self.use_moe = use_moe
 
         if use_moe:
@@ -1295,9 +1910,11 @@ class TransformerDecoderLayer(Module):
         self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, **factory_kwargs)
         self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, **factory_kwargs)
         self.norm3 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, **factory_kwargs)
+        self.norm4 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, **factory_kwargs)
         self.dropout1 = Dropout(dropout)
         self.dropout2 = Dropout(dropout)
         self.dropout3 = Dropout(dropout)
+        self.dropout4 = Dropout(dropout)
 
         # Legacy string support for activation function.
         if isinstance(activation, str):
@@ -1314,8 +1931,12 @@ class TransformerDecoderLayer(Module):
         self,
         tgt: Tensor,
         memory: Tensor,
+        token_types: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
+        inst_memory: Optional[Tensor] = None,
+        inst_mask: Optional[Tensor] = None,
+        inst_key_padding_mask: Optional[Tensor] = None,
         tgt_is_causal: bool = False,
         memory_is_causal: bool = False,
     ) -> Tensor:
@@ -1351,31 +1972,56 @@ class TransformerDecoderLayer(Module):
         # print(f'target is causal: {tgt_is_causal}')
         if self.norm_first:
             x = x + self._sa_block(self.norm1(x), tgt_is_causal)
-            x = x + self._mha_block(
+            text_attn_out = self._mha_block(
                 self.norm2(x),
                 memory,
                 memory_mask,
                 memory_key_padding_mask,
                 memory_is_causal,
             )
+            if inst_memory is not None:
+                inst_attn_out = self._inst_mha_block(
+                    self.norm3(x),
+                    inst_memory,
+                    None,
+                    inst_key_padding_mask,
+                    memory_is_causal,
+                )
+                fused_attn = self.cross_attn_gating(
+                    text_attn_out, inst_attn_out, token_types
+                )
+            else:
+                fused_attn = text_attn_out
+            x = x + fused_attn
             if self.use_moe:
                 m, total_aux_loss, balance_loss, router_z_loss = self.moe_block(x)
                 x = x + m
             else:
-                x = x + self._ff_block(self.norm3(x))
+                x = x + self._ff_block(self.norm4(x))
         else:
             x = self.norm1(x + self._sa_block(x, tgt_is_causal))
-            x = self.norm2(
-                x
-                + self._mha_block(
-                    x, memory, memory_mask, memory_key_padding_mask, memory_is_causal
-                )
+            text_attn_out = self._mha_block(
+                x, memory, memory_mask, memory_key_padding_mask, memory_is_causal
             )
+            if inst_memory is not None:
+                inst_attn_out = self._inst_mha_block(
+                    x,
+                    inst_memory,
+                    None,
+                    inst_key_padding_mask,
+                    memory_is_causal,
+                )
+                fused_attn = self.cross_attn_gating(
+                    text_attn_out, inst_attn_out, token_types
+                )
+            else:
+                fused_attn = text_attn_out
+            x = self.norm2(x + fused_attn)
             if self.use_moe:
                 m, total_aux_loss, balance_loss, router_z_loss = self.moe_block(x)
                 x = x + m
             else:
-                x = self.norm3(x + self._ff_block(x))
+                x = self.norm4(x + self._ff_block(x))
 
         if self.use_moe:
             return x, total_aux_loss, balance_loss, router_z_loss
@@ -1407,10 +2053,29 @@ class TransformerDecoderLayer(Module):
         )[0]
         return self.dropout2(x)
 
+    def _inst_mha_block(
+        self,
+        x: Tensor,
+        mem: Tensor,
+        attn_mask: Optional[Tensor],
+        key_padding_mask: Optional[Tensor],
+        is_causal: bool = False,
+    ) -> Tensor:
+        x = self.inst_multihead_attn(
+            x,
+            mem,
+            mem,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            is_causal=is_causal,
+            need_weights=False,
+        )[0]
+        return self.dropout3(x)
+
     # feed forward block
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        return self.dropout3(x)
+        return self.dropout4(x)
 
 
 def _get_clones(module, N):
@@ -1674,6 +2339,57 @@ def test_generate(caption):
     # Decode and save MIDI
     generated_midi = r_tokenizer.decode(output_list)
     generated_midi.dump_midi(f"../../output_christmas_2.mid")
+
+
+def run_inline_instrument_conditioning_test() -> None:
+    """Smoke test for dual cross-attention and forbidden token masking."""
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+
+    class DummyTextEncoder(nn.Module):
+        def __init__(self, vocab_size: int, d_model: int):
+            super().__init__()
+            self.embed = nn.Embedding(vocab_size, d_model)
+
+        def forward(self, input_ids, attention_mask=None):
+            hidden_states = self.embed(input_ids)
+            return SimpleNamespace(last_hidden_state=hidden_states)
+
+    vocab_size = 32
+    d_model = 16
+    text_vocab = 50
+    model = Transformer(
+        n_vocab=vocab_size,
+        d_model=d_model,
+        nhead=2,
+        max_len=32,
+        num_decoder_layers=2,
+        dim_feedforward=64,
+        use_moe=False,
+        device=device,
+        text_encoder=DummyTextEncoder(text_vocab, d_model),
+        instrument_vocab_size=8,
+        use_instrument_conditioning=True,
+    )
+
+    src = torch.randint(0, text_vocab, (1, 4), device=device)
+    src_mask = torch.ones_like(src)
+    inst_ids = torch.tensor([[0, 1, 2]], device=device)
+    inst_mask = torch.ones_like(inst_ids)
+
+    forbidden = {2, 3}
+    generated = model.generate(
+        src,
+        src_mask,
+        max_len=6,
+        temperature=1.0,
+        forbidden_token_ids=forbidden,
+        inst=inst_ids,
+        inst_mask=inst_mask,
+    )
+    tokens = generated[0].tolist()
+    assert forbidden.isdisjoint(tokens), f"Forbidden tokens leaked: {tokens}"
+    print("Inline instrument conditioning test passed. Generated tokens:", tokens)
 
 
 def load_model_and_tokenizer(accelerator, model_path, vocab_size, tokenizer_filepath):
