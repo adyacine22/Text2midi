@@ -155,21 +155,42 @@ INSTRUMENTS = {
 
 # General MIDI instrument classes -> list of program numbers
 INSTRUMENT_CLASSES = {
-    "Drums / Percussion": [-1],
-    "Piano": list(range(0, 8)),                    # 0–7
-    "Chromatic Percussion": list(range(8, 16)),    # 8–15
-    "Organ": list(range(16, 24)),                  # 16–23
-    "Guitar": list(range(24, 32)),                 # 24–31
-    "Bass": list(range(32, 40)),                   # 32–39
-    "Strings": list(range(40, 48)),                # 40–47
-    "Ensemble": list(range(48, 56)),               # 48–55
-    "Brass": list(range(56, 64)),                  # 56–63
-    "Reed": list(range(64, 72)),                   # 64–71
-    "Pipe / Winds": list(range(72, 80)),           # 72–79
-    "Synth Lead": list(range(80, 88)),             # 80–87
-    "Synth Pad": list(range(88, 96)),              # 88–95
-    "Synth Effects": list(range(96, 104)),         # 96–103
-    "Ethnic": list(range(104, 112)),               # 104–111
-    "Percussive": list(range(112, 120)),           # 112–119
-    "Sound Effects": list(range(120, 128)),        # 120–127
+    "Drums": [-1],  # Channel 10
+
+    # Keyboards
+    "Piano": list(range(0, 8)),             # 0–7
+    "Mallets": list(range(8, 16)),           # 8–15
+    "Organs / Keyboards": list(range(16, 24)),
+
+    # Guitars / Basses
+    "Guitars": list(range(24, 32)),
+    "Basses": list(range(32, 40)),
+
+    # Orchestral strings
+    "Solo Strings": [40, 41, 42, 43],       # violin–bass
+    "String Articulations": [44, 45],       # tremolo, pizz
+    "Harp": [46],
+    "Timpani": [47],
+
+    # Ensembles (real or synth)
+    "String Ensembles": [48, 49, 50, 51],   # Acoustic + Synth strings
+    "Choirs / Voice Pads": [52, 53, 54],    # Aahs/Oohs/Synth voice
+    "Orchestra Hit": [55],
+
+    # Brass & Winds (true acoustic families)
+    "Brass": [56, 57, 58, 59, 60, 61],      # trumpets → horns
+    "Saxophones": [64, 65, 66, 67],         
+    "Double Reeds": [68, 69, 70],           # oboe → bassoon
+    "Clarinets": [71],
+    "Flutes & Pipes": list(range(72, 80)),
+
+    # Synths
+    "Synth Leads": list(range(80, 88)),
+    "Synth Pads": list(range(88, 96)),
+    "Synth FX": list(range(96, 104)),
+
+    # World / Percussion / Misc
+    "World Instruments": list(range(104, 112)),
+    "Percussive Instruments": list(range(112, 120)),
+    "Sound Effects": list(range(120, 128)),
 }

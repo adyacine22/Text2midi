@@ -3,7 +3,7 @@
 import copy
 import json
 from types import SimpleNamespace
-from typing import Optional, Any, Union, Callable, Iterable, List
+from typing import Optional, Any, Union, Callable, Iterable, List, Tuple
 import torch.multiprocessing as mp
 from torch.nn import DataParallel
 import jsonlines
@@ -181,18 +181,19 @@ class SimpleTokenTypeGating(nn.Module):
     def __init__(self, d_model: int, device: torch.device | None = None):
         super().__init__()
         factory_kwargs = {"device": device}
-        initial_weights = torch.tensor(
-            [
-                [0.35, 0.65],  # instrument tokens lean on instrument memory
-                [0.9, 0.1],  # onset tokens use textual cues
-                [0.55, 0.45],  # pitch tokens still leverage instruments
-                [0.6, 0.4],  # duration tokens modestly prefer text
-                [0.5, 0.5],  # bar tokens balanced
-                [0.6, 0.4],  # fallback for other tokens
-            ],
-            **factory_kwargs,
+        self.num_token_types = 8
+        
+        # Learnable weights for each token type: (num_token_types, 2 * d_model)
+        self.gate_weights = nn.Parameter(
+            torch.empty(self.num_token_types, 2 * d_model, **factory_kwargs)
         )
-        self.weights = nn.Parameter(initial_weights)
+        # Learnable bias for each token type: (num_token_types,)
+        self.gate_bias = nn.Parameter(
+            torch.zeros(self.num_token_types, **factory_kwargs)
+        )
+        
+        # Initialize weights
+        nn.init.xavier_uniform_(self.gate_weights)
 
     def forward(
         self,
@@ -203,11 +204,27 @@ class SimpleTokenTypeGating(nn.Module):
         if token_types is None:
             return text_out + inst_out
 
-        weights = self.weights.to(text_out.dtype)
-        selected = weights[token_types]  # (batch, seq, 2)
-        selected = selected / selected.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        # Retrieve weights and biases for each token in the batch
+        # token_types: (batch, seq)
+        # w_k: (batch, seq, 2 * d_model)
+        w_k = F.embedding(token_types, self.gate_weights)
+        # b_k: (batch, seq)
+        b_k = F.embedding(token_types, self.gate_bias.unsqueeze(1)).squeeze(-1)
 
-        fused = selected[..., 0:1] * text_out + selected[..., 1:2] * inst_out
+        # Concatenate contexts: [C_text; C_inst]
+        # text_out, inst_out: (batch, seq, d_model)
+        concat_context = torch.cat([text_out, inst_out], dim=-1) # (batch, seq, 2 * d_model)
+
+        # Compute logits: w_k^T * [C_text; C_inst] + b_k
+        # We use element-wise multiplication and sum over the last dimension to simulate dot product per token
+        logits = (w_k * concat_context).sum(dim=-1) + b_k # (batch, seq)
+
+        # Compute alpha = sigmoid(logits)
+        alpha = torch.sigmoid(logits).unsqueeze(-1) # (batch, seq, 1)
+
+        # Fuse: h_fused = alpha * C_text + (1 - alpha) * C_inst
+        fused = alpha * text_out + (1 - alpha) * inst_out
+        
         return fused
 
 
@@ -289,7 +306,7 @@ def precompute_freqs_cis(
     return cache.to(dtype=dtype, device=device)
 
 
-@torch.jit.script
+# @torch.jit.script
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """
     In-place RoPE. Credits to Katherine Crowson:
@@ -366,15 +383,21 @@ class MultiHeadSelfAttention(nn.Module):
             and self.dim_head <= 128
         )
 
-    def forward(self, x: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        is_causal: bool = True,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         r"""Forward pass of the multi-head self-attention module.
 
         Args:
             x (torch.Tensor): The input tensor of shape (batch_size, sequence_length, embed_dim).
+            past_key_value: Tuple of (key, value) from previous step.
 
         Returns:
-            torch.Tensor: The output tensor of shape (batch_size, sequence_length, embed_dim).
-
+            torch.Tensor: The output tensor.
+            past_key_value: Updated tuple of (key, value).
         """
         if not self.batch_first:
             x = x.transpose(0, 1)
@@ -382,20 +405,39 @@ class MultiHeadSelfAttention(nn.Module):
         q, k, v = torch.chunk(self.to_qkv(x), chunks=3, dim=-1)
         q, k, v = map(lambda t: t.contiguous().view(b, self.heads, n, -1), (q, k, v))
 
+        # Determine start position for RoPE
+        if past_key_value is not None:
+            start_pos = past_key_value[0].shape[2]
+        else:
+            start_pos = 0
+
+        # Compute RoPE for the *current* tokens
+        # We need freqs for [start_pos : start_pos + n]
         freqs_cis = precompute_freqs_cis(
-            seq_len=n,
+            seq_len=start_pos + n,
             n_elem=self.embed_dim // self.heads,
             base=10000,
-            dtype=x.dtype,
+            dtype=q.dtype,
             device=x.device,
-        )[: x.shape[1]]
+        )[start_pos : start_pos + n]
+        
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
-        if self._should_use_flash_attn(x):
-            # Prefer PyTorch’s built-in flash attention kernel where available.
-            # Disable other kernels to steer the dispatcher.
+        
+        # KV Cache update
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        
+        current_past_key_value = (k, v)
+
+        # Check Flash Attention
+        # Note: Flash Attention expects q, k, v to have same dtype.
+        # If using cache, k/v might grow large.
+        if self._should_use_flash_attn(q):
             with torch.backends.cuda.sdp_kernel(
-                enable_flash=True, enable_math=False, enable_mem_efficient=False
+                enable_flash=True, enable_math=False, enable_mem_efficient=True
             ):
                 out = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v, is_causal=is_causal
@@ -404,9 +446,14 @@ class MultiHeadSelfAttention(nn.Module):
             out = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, is_causal=is_causal
             )
+            
         out = out.contiguous().view(b, n, -1)
         out = self.dropout(out)
-        return self.to_out(out)
+        
+        if not self.batch_first:
+            out = out.transpose(0, 1)
+            
+        return self.to_out(out), current_past_key_value
 
 
 class Transformer(Module):
@@ -571,7 +618,9 @@ class Transformer(Module):
         memory_key_padding_mask: Optional[Tensor] = None,
         tgt_is_causal: bool = True,
         memory_is_causal: bool = False,
-    ) -> Tensor:
+        disable_instrument_masking: bool = False,
+        past_key_values: Optional[List[Tuple[Tensor, Tensor]]] = None,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, List[Tuple[Tensor, Tensor]]], Tuple[Tensor, List[Tuple[Tensor, Tensor]]]]:
         r"""Take in and process masked source/target sequences.
 
         .. note::
@@ -604,6 +653,7 @@ class Transformer(Module):
                 ``memory_mask`` is the causal mask. Providing incorrect
                 hints can result in incorrect execution, including
                 forward and backward compatibility.
+            past_key_values: list of past key and value tensors for each layer (optional).
 
         Shape:
             - src: :math:`(S, S)` for unbatched input, :math:`(S, N)` if `batch_first=False` or
@@ -666,11 +716,15 @@ class Transformer(Module):
         # Positional encoding is now handled by RoPE in attention
         # tgt = self.pos_encoder(tgt)
 
-        active_classes = self._compute_active_class_mask(inst, inst_mask)
+        active_classes = (
+            self._compute_active_class_mask(inst, inst_mask)
+            if not disable_instrument_masking
+            else None
+        )
 
         if self.use_moe:
             with torch.cuda.amp.autocast(enabled=False):
-                output, sum_total_aux_loss = self.decoder(
+                output, sum_total_aux_loss, new_past_key_values = self.decoder(
                     tgt,
                     memory,
                     inst_memory=inst_memory,
@@ -682,9 +736,10 @@ class Transformer(Module):
                     inst_key_padding_mask=inst_key_padding_mask,
                     tgt_is_causal=tgt_is_causal,
                     memory_is_causal=memory_is_causal,
+                    past_key_values=past_key_values,
                 )
         else:
-            output = self.decoder(
+            output, new_past_key_values = self.decoder(
                 tgt,
                 memory,
                 inst_memory=inst_memory,
@@ -696,6 +751,7 @@ class Transformer(Module):
                 inst_key_padding_mask=inst_key_padding_mask,
                 tgt_is_causal=tgt_is_causal,
                 memory_is_causal=memory_is_causal,
+                past_key_values=past_key_values,
             )
 
         output = self.projection(
@@ -706,9 +762,9 @@ class Transformer(Module):
         # output = F.log_softmax(output, dim=-1)
 
         if self.use_moe:
-            return output, sum_total_aux_loss
+            return output, sum_total_aux_loss, new_past_key_values
         else:
-            return output
+            return output, new_past_key_values
 
     def _get_valid_instrument_programs(self, inst_ids: Optional[Tensor]) -> Optional[Union[List[int], Tensor]]:
         """Map instrument class IDs to valid MIDI program numbers per sample.
@@ -783,17 +839,32 @@ class Transformer(Module):
         # Get token mappings
         id_to_token = getattr(tokenizer, "id_to_token", {})
         
-        # Always mask out special tokens (PAD, BOS, EOS, MASK) except EOS in AFTER_BAR state
+        # Create a permanent mask for special tokens that should NEVER be generated
+        special_token_mask = torch.ones(vocab_size, dtype=torch.bool, device=logits.device)
         for tok_id, tok_str in id_to_token.items():
             if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
                 token = str(tok_str)
                 if token in ["PAD_None", "BOS_None", "MASK_None"]:
                     # These should never be generated
-                    pass  # Leave mask[tok_id] = False
+                    special_token_mask[tok_id] = False
         
         # Define which token types are allowed in each state
         if current_state == "START_BAR":
-            # Only instrument tokens allowed
+            # Strict pattern: Bar must start with Time Signature (s-)
+            for tok_id, tok_str in id_to_token.items():
+                if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
+                    if str(tok_str).startswith("s-"):
+                        mask[tok_id] = True
+
+        elif current_state == "AFTER_TIME_SIG":
+            # Strict pattern: Time Signature must be followed by Tempo (t-)
+            for tok_id, tok_str in id_to_token.items():
+                if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
+                    if str(tok_str).startswith("t-"):
+                        mask[tok_id] = True
+
+        elif current_state == "AFTER_TEMPO":
+            # Strict pattern: Tempo must be followed by Instrument (i-) to start notes
             for tok_id, tok_str in id_to_token.items():
                 if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
                     token = str(tok_str)
@@ -806,7 +877,6 @@ class Transformer(Module):
                                     if program in valid_programs:
                                         mask[tok_id] = True
                                 elif isinstance(valid_programs, torch.Tensor):
-                                    # Allow in base mask, filter later per sample
                                     mask[tok_id] = True
                             except (ValueError, IndexError):
                                 pass
@@ -839,10 +909,12 @@ class Transformer(Module):
             for tok_id, tok_str in id_to_token.items():
                 if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
                     token = str(tok_str)
-                    if token.startswith("o-") or token.startswith("b-"):
+                    if token.startswith("o-"):
+                        mask[tok_id] = True
+                    elif token.startswith("b-"):
                         mask[tok_id] = True
                     elif token.startswith("i-"):
-                        # Allow new instrument in same bar
+                        # Check if this instrument is in valid_programs
                         if valid_programs is not None:
                             try:
                                 program = int(token.split("-")[1])
@@ -858,25 +930,13 @@ class Transformer(Module):
                             mask[tok_id] = True
         
         elif current_state == "AFTER_BAR":
-            # Can generate instrument (new track) or EOS (end sequence)
+            # Strict pattern: New bar starts with Time Signature (s-) or End of Sequence
             for tok_id, tok_str in id_to_token.items():
                 if isinstance(tok_id, int) and 0 <= tok_id < vocab_size:
                     token = str(tok_str)
-                    if token.startswith("i-"):
-                        # Check if this instrument is in valid_programs
-                        if valid_programs is not None:
-                            try:
-                                program = int(token.split("-")[1])
-                                if isinstance(valid_programs, list):
-                                    if program in valid_programs:
-                                        mask[tok_id] = True
-                                elif isinstance(valid_programs, torch.Tensor):
-                                    # Allow in base mask, filter later per sample
-                                    mask[tok_id] = True
-                            except (ValueError, IndexError):
-                                pass
-                        else:
-                            mask[tok_id] = True
+                    
+                    if token.startswith("s-"):
+                        mask[tok_id] = True
                     elif token == "EOS_None":
                         mask[tok_id] = True
         
@@ -889,7 +949,7 @@ class Transformer(Module):
             mask_expanded = mask.unsqueeze(0).expand(batch_size, -1).clone()
             
             # Apply per-sample instrument constraints if valid_programs is a Tensor
-            if isinstance(valid_programs, torch.Tensor) and (current_state in ["START_BAR", "AFTER_DURATION", "AFTER_BAR"]):
+            if isinstance(valid_programs, torch.Tensor) and (current_state in ["START_BAR", "AFTER_DURATION", "AFTER_BAR", "AFTER_TIME_SIG", "AFTER_TEMPO"]):
                  # Iterate over instrument tokens and refine mask
                  # This is slightly inefficient but safe. 
                  # Optimization: Pre-compute instrument token IDs if this is too slow.
@@ -906,8 +966,14 @@ class Transformer(Module):
                              except (ValueError, IndexError):
                                  pass
             
+            # Always enforce special token mask (PAD, BOS, MASK should never be generated)
+            special_token_mask_expanded = special_token_mask.unsqueeze(0).expand(batch_size, -1)
+            mask_expanded = mask_expanded & special_token_mask_expanded
+            
             logits_masked[~mask_expanded] = float("-inf")
         else:  # (vocab_size,)
+            # Apply special token mask
+            mask = mask & special_token_mask
             logits_masked[~mask] = float("-inf")
         
         return logits_masked
@@ -921,18 +987,23 @@ class Transformer(Module):
         forbidden_token_ids: Optional[Iterable[int]] = None,
         inst: Optional[Tensor] = None,
         inst_mask: Optional[Tensor] = None,
-    ):
-        ## ADD A START OF SEQUENCE TOKEN  <SS> token to the src tensor
-        r"""Generate a sequence of tokens from the given inputs.
+        multitrack_bias: float = 0.0,
+        bar_bias: float = 0.0,
+        disable_grammar_constraints: bool = False,
+        disable_instrument_masking: bool = False,
+        use_kv_cache: bool = True,
+    ) -> torch.Tensor:
+        r"""Generate a sequence of tokens using the transformer model.
 
         Args:
-            src: the sequence to the encoder (required).
-            src_mask: the attention mask for the src sequence (required).
-            max_len: the maximum length of the sequence to generate (default=100).
-            temperature: the temperature for the softmax (default=1.0).
+            src: The input sequence to the encoder (batch, src_seq_len).
+            src_mask: The attention mask for the src sequence (batch, src_seq_len).
+            max_len: The maximum length of the generated sequence.
+            temperature: The temperature for sampling.
             forbidden_token_ids: Optional iterable of token ids that should never be sampled.
             inst: Optional instrument instruction ids (batch, seq).
             inst_mask: Optional attention mask (batch, seq) for instruments.
+            use_kv_cache: Whether to use Key-Value caching for faster inference.
 
         Returns:
             torch.Tensor: The generated sequence of tokens.
@@ -954,8 +1025,8 @@ class Transformer(Module):
 
         tgt_fin = torch.full((src.size(0), 1), 1, dtype=torch.long, device=src.device)
         
-        # Get valid instrument programs from inst_ids
-        valid_programs = self._get_valid_instrument_programs(inst)
+        # Get valid instrument programs from inst_ids (only if masking is enabled)
+        valid_programs = self._get_valid_instrument_programs(inst) if not disable_instrument_masking else None
         
         # Initialize state machine
         current_state = "START_BAR"
@@ -963,10 +1034,16 @@ class Transformer(Module):
         # Get tokenizer for masking
         tokenizer = getattr(self, "tokenizer", None)
         
+        past_key_values = None
+        
         for i in tqdm(range(max_len)):
-            tgt = tgt_fin
+            if use_kv_cache and past_key_values is not None:
+                tgt = tgt_fin[:, -1:]
+            else:
+                tgt = tgt_fin
+
             if self.use_moe:
-                output, _ = self.forward(
+                output, _, past_key_values = self.forward(
                     src,
                     src_mask,
                     tgt,
@@ -976,9 +1053,11 @@ class Transformer(Module):
                     memory_key_padding_mask=None,
                     tgt_is_causal=True,
                     memory_is_causal=False,
+                    disable_instrument_masking=disable_instrument_masking,
+                    past_key_values=past_key_values if use_kv_cache else None,
                 )
             else:
-                output = self.forward(
+                output, past_key_values = self.forward(
                     src,
                     src_mask,
                     tgt,
@@ -988,6 +1067,8 @@ class Transformer(Module):
                     memory_key_padding_mask=None,
                     tgt_is_causal=True,
                     memory_is_causal=False,
+                    disable_instrument_masking=disable_instrument_masking,
+                    past_key_values=past_key_values if use_kv_cache else None,
                 )
             
             logits = output
@@ -999,19 +1080,88 @@ class Transformer(Module):
             last_logits = logits[:, -1, :]
             
             # Apply structural mask based on current state
-            if tokenizer is not None:
+            if tokenizer is not None and not disable_grammar_constraints:
                 masked_logits = self._apply_structural_mask(
                     last_logits,
                     current_state,
                     valid_programs,
-                    tokenizer
+                    tokenizer,
                 )
                 
                 # If all logits are -inf, fall back to unmasked (safety)
+                # But still mask out special tokens
                 if not torch.any(torch.isfinite(masked_logits)):
-                    pass  # Use unmasked logits
+                    # Fallback: use unmasked logits but still exclude special tokens
+                    id_to_token = getattr(tokenizer, "id_to_token", {})
+                    for tok_id, tok_str in id_to_token.items():
+                        if isinstance(tok_id, int) and 0 <= tok_id < last_logits.size(-1):
+                            token = str(tok_str)
+                            if token in ["PAD_None", "BOS_None", "MASK_None"]:
+                                last_logits[:, tok_id] = float("-inf")
                 else:
                     last_logits = masked_logits
+            else:
+                # Even without grammar constraints, always mask special tokens
+                if tokenizer is not None:
+                    id_to_token = getattr(tokenizer, "id_to_token", {})
+                    for tok_id, tok_str in id_to_token.items():
+                        if isinstance(tok_id, int) and 0 <= tok_id < last_logits.size(-1):
+                            token = str(tok_str)
+                            if token in ["PAD_None", "BOS_None", "MASK_None"]:
+                                last_logits[:, tok_id] = float("-inf")
+            
+            # Apply multitrack bias: boost instrument tokens in AFTER_DURATION/AFTER_BAR states
+            if tokenizer is not None and current_state in ["AFTER_DURATION", "AFTER_BAR"] and multitrack_bias > 0:
+                id_to_token = getattr(tokenizer, "id_to_token", {})
+                
+                # Pre-compute instrument token indices if not already done
+                if not hasattr(self, "_instrument_token_indices"):
+                    self._instrument_token_indices = {} # Map program_id (0-128) to token_id
+                    for tok_id, tok_str in id_to_token.items():
+                        if isinstance(tok_id, int) and 0 <= tok_id < last_logits.size(-1):
+                            s = str(tok_str)
+                            if s.startswith("i-"):
+                                try:
+                                    # Parse program ID from token string "i-123"
+                                    prog_id = int(s.split("-")[1])
+                                    self._instrument_token_indices[prog_id] = tok_id
+                                except (ValueError, IndexError):
+                                    pass
+                
+                # Apply bias
+                if valid_programs is not None:
+                    # Targeted bias: only boost allowed instruments per sample
+                    # valid_programs is (batch, 129) boolean mask
+                    # We need to map this to (batch, vocab_size) bias
+                    
+                    # Iterate over the 129 possible programs
+                    for prog_id, tok_id in self._instrument_token_indices.items():
+                        if 0 <= prog_id < valid_programs.size(1):
+                            # Get mask for this program across batch: (batch,)
+                            prog_mask = valid_programs[:, prog_id]
+                            
+                            # Apply bias only where allowed
+                            # last_logits[:, tok_id] += multitrack_bias * prog_mask.float()
+                            # Use where to avoid in-place modification issues if any
+                            last_logits[:, tok_id] = torch.where(
+                                prog_mask,
+                                last_logits[:, tok_id] + multitrack_bias,
+                                last_logits[:, tok_id]
+                            )
+                else:
+                    # Fallback: boost ALL instrument tokens if no constraints
+                    for tok_id in self._instrument_token_indices.values():
+                        last_logits[:, tok_id] += multitrack_bias
+            
+            # Apply bar bias: boost b-1 token in AFTER_DURATION state to encourage progression
+            if tokenizer is not None and current_state == "AFTER_DURATION" and bar_bias != 0:
+                id_to_token = getattr(tokenizer, "id_to_token", {})
+                # Find b-1 token
+                for tok_id, tok_str in id_to_token.items():
+                    if isinstance(tok_id, int) and 0 <= tok_id < last_logits.size(-1):
+                        if str(tok_str) == "b-1":
+                            last_logits[:, tok_id] += bar_bias
+                            break
             
             # Sample next token
             probs = F.softmax(last_logits / temperature, dim=-1)
@@ -1022,7 +1172,9 @@ class Transformer(Module):
                 next_token_id = int(next_tokens[0, 0].item())
                 next_token_str = tokenizer.id_to_token.get(next_token_id, "")
                 
+                # Follow strict REMI-z pattern: i-X → o-X → p-X → d-X
                 if next_token_str.startswith("i-"):
+                    # Always transition to AFTER_INSTRUMENT to enforce i→o pattern
                     current_state = "AFTER_INSTRUMENT"
                 elif next_token_str.startswith("o-"):
                     current_state = "AFTER_ONSET"
@@ -1032,6 +1184,10 @@ class Transformer(Module):
                     current_state = "AFTER_DURATION"
                 elif next_token_str.startswith("b-"):
                     current_state = "AFTER_BAR"
+                elif next_token_str.startswith("s-"):
+                    current_state = "AFTER_TIME_SIG"
+                elif next_token_str.startswith("t-"):
+                    current_state = "AFTER_TEMPO"
                 elif next_token_str == "EOS_None":
                     # End of sequence, break early
                     tgt_fin = torch.cat((tgt_fin, next_tokens), dim=1)
@@ -1065,7 +1221,7 @@ class Transformer(Module):
         vocab_size: int,
         device: Optional[torch.device] = None,
     ) -> Tensor:
-        lookup = torch.full((vocab_size,), 5, dtype=torch.long)
+        lookup = torch.full((vocab_size,), 7, dtype=torch.long)  # Default to fallback type (7+)
         if tokenizer is None:
             return lookup.to(device) if device is not None else lookup
 
@@ -1074,17 +1230,19 @@ class Transformer(Module):
             return lookup.to(device) if device is not None else lookup
 
         prefix_to_type = {
-            "i-": 0,
-            "o-": 1,
-            "p-": 2,
-            "d-": 3,
-            "b-": 4,
+            "i-": 0,  # instrument
+            "o-": 1,  # onset
+            "p-": 2,  # pitch
+            "d-": 3,  # duration
+            "b-": 4,  # bar
+            "s-": 5,  # time signature
+            "t-": 6,  # tempo
         }
         for tok_id, tok_str in id_to_token.items():
             if not isinstance(tok_id, int) or tok_id >= vocab_size or tok_id < 0:
                 continue
             token = str(tok_str)
-            token_type = 5
+            token_type = 7  # Default to fallback type (type 7+)
             for prefix, t_type in prefix_to_type.items():
                 if token.startswith(prefix):
                     token_type = t_type
@@ -1407,26 +1565,25 @@ class TransformerDecoder(Module):
         self,
         tgt: Tensor,
         memory: Tensor,
-        inst_memory: Optional[Tensor] = None,
         token_types: Optional[Tensor] = None,
-        tgt_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
+        inst_memory: Optional[Tensor] = None,
         inst_mask: Optional[Tensor] = None,
         inst_key_padding_mask: Optional[Tensor] = None,
-        tgt_is_causal: Optional[bool] = None,
+        tgt_is_causal: bool = False,
         memory_is_causal: bool = False,
-    ) -> Tensor:
+        past_key_values: Optional[List[Tuple[Tensor, Tensor]]] = None,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, List[Tuple[Tensor, Tensor]]], Tuple[Tensor, List[Tuple[Tensor, Tensor]]]]:
         r"""Pass the inputs (and mask) through the decoder layer in turn.
 
         Args:
             tgt: the sequence to the decoder (required).
             memory: the sequence from the last layer of the encoder (required).
-            tgt_mask: the mask for the tgt sequence (optional).
             memory_mask: the mask for the memory sequence (optional).
             memory_key_padding_mask: the mask for the memory keys per batch (optional).
             tgt_is_causal: If specified, applies a causal mask as ``tgt mask``.
-                Default: ``None``; try to detect a causal mask.
+                Default: ``False``.
                 Warning:
                 ``tgt_is_causal`` provides a hint that ``tgt_mask`` is
                 the causal mask. Providing incorrect hints can result in
@@ -1440,20 +1597,24 @@ class TransformerDecoder(Module):
                 ``memory_mask`` is the causal mask. Providing incorrect
                 hints can result in incorrect execution, including
                 forward and backward compatibility.
+            past_key_values: list of past key and value tensors for each layer (optional).
 
         Shape:
             see the docs in :class:`~torch.nn.Transformer`.
         """
         output = tgt
 
+        new_past_key_values = []
+
         seq_len = _get_seq_len(tgt, self.layers[0].self_attn.batch_first)
-        tgt_is_causal = _detect_is_causal_mask(tgt_mask, tgt_is_causal, seq_len)
+        tgt_is_causal = _detect_is_causal_mask(None, tgt_is_causal, seq_len)
         # print(f'target is causal: {tgt_is_causal}')
 
         if self.use_moe:
             sum_total_aux_loss = 0
-            for mod in self.layers:
-                output, total_aux_loss, balance_loss, router_z_loss = mod(
+            for i, mod in enumerate(self.layers):
+                past_key_value = past_key_values[i] if past_key_values is not None else None
+                output, total_aux_loss, balance_loss, router_z_loss, current_past_key_value = mod(
                     output,
                     memory,
                     inst_memory=inst_memory,
@@ -1464,11 +1625,14 @@ class TransformerDecoder(Module):
                     inst_key_padding_mask=inst_key_padding_mask,
                     tgt_is_causal=tgt_is_causal,
                     memory_is_causal=memory_is_causal,
+                    past_key_value=past_key_value,
                 )
+                new_past_key_values.append(current_past_key_value)
                 sum_total_aux_loss += total_aux_loss
         else:
-            for mod in self.layers:
-                output = mod(
+            for i, mod in enumerate(self.layers):
+                past_key_value = past_key_values[i] if past_key_values is not None else None
+                output, current_past_key_value = mod(
                     output,
                     memory,
                     inst_memory=inst_memory,
@@ -1479,15 +1643,17 @@ class TransformerDecoder(Module):
                     inst_key_padding_mask=inst_key_padding_mask,
                     tgt_is_causal=tgt_is_causal,
                     memory_is_causal=memory_is_causal,
+                    past_key_value=past_key_value,
                 )
+                new_past_key_values.append(current_past_key_value)
 
         if self.norm is not None:
             output = self.norm(output)
 
         if self.use_moe:
-            return output, sum_total_aux_loss
+            return output, sum_total_aux_loss, new_past_key_values
         else:
-            return output
+            return output, new_past_key_values
 
 
 class TransformerEncoderLayer(Module):
@@ -1798,6 +1964,149 @@ class TransformerEncoderLayer(Module):
         return self.dropout2(x)
 
 
+
+class MultiHeadCrossAttention(nn.Module):
+    r"""Multi-head cross-attention module with Flash Attention support.
+
+    Args:
+        embed_dim (int): The input embedding dimension.
+        num_heads (int): The number of attention heads.
+        dropout (float, optional): The dropout probability (default: 0.1).
+        batch_first (bool, optional): If ``True``, then the input and output tensors are provided
+            as (batch, seq, feature). Default: ``False`` (seq, batch, feature).
+        device (torch.device, optional): The device to use (default: None).
+        dtype (torch.dtype, optional): The data type to use (default: None).
+        use_flash_attn (bool, optional): Whether to use Flash Attention (default: True).
+        bias (bool, optional): If set to ``False``, layers will not learn an additive bias. Default: ``True``.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        batch_first: bool = False,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        use_flash_attn: bool = True,
+        bias: bool = True,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.use_flash_attn = use_flash_attn
+        self.batch_first = batch_first
+        self.dropout_p = dropout
+
+        # Use in_proj_weight/bias to match nn.MultiheadAttention state_dict for compatibility
+        self.in_proj_weight = nn.Parameter(torch.empty(3 * embed_dim, embed_dim, **factory_kwargs))
+        if bias:
+            self.in_proj_bias = nn.Parameter(torch.empty(3 * embed_dim, **factory_kwargs))
+        else:
+            self.register_parameter('in_proj_bias', None)
+            
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
+
+        self.dropout = nn.Dropout(dropout)
+        
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        xavier_uniform_(self.in_proj_weight)
+        if self.in_proj_bias is not None:
+            nn.init.constant_(self.in_proj_bias, 0.)
+            nn.init.constant_(self.out_proj.bias, 0.)
+
+    def _should_use_flash_attn(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
+        # FlashAttention requires CUDA, a supported head dimension, and half/bfloat precision
+        return (
+            self.use_flash_attn
+            and query.is_cuda
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and self.head_dim % 8 == 0
+            and self.head_dim <= 128
+        )
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        key_padding_mask: Optional[Tensor] = None,
+        need_weights: bool = True,
+        attn_mask: Optional[Tensor] = None,
+        is_causal: bool = False,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        
+        if not self.batch_first:
+            query = query.transpose(0, 1)
+            key = key.transpose(0, 1)
+            value = value.transpose(0, 1)
+            
+        batch_size, seq_q, _ = query.shape
+        _, seq_k, _ = key.shape
+        
+        # Unpack weights for compatibility with nn.MultiheadAttention
+        q_w, k_w, v_w = self.in_proj_weight.chunk(3, dim=0)
+        if self.in_proj_bias is not None:
+            q_b, k_b, v_b = self.in_proj_bias.chunk(3, dim=0)
+        else:
+            q_b, k_b, v_b = None, None, None
+            
+        # Project
+        q = F.linear(query, q_w, q_b).view(batch_size, seq_q, self.num_heads, self.head_dim).transpose(1, 2)
+        k = F.linear(key, k_w, k_b).view(batch_size, seq_k, self.num_heads, self.head_dim).transpose(1, 2)
+        v = F.linear(value, v_w, v_b).view(batch_size, seq_k, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Handle key_padding_mask
+        sdpa_mask = attn_mask
+        
+        if key_padding_mask is not None:
+            # key_padding_mask comes from HF tokenizer (1=attend, 0=ignore)
+            # SDPA expects boolean mask where True=attend, False=ignore
+            
+            if key_padding_mask.dtype == torch.bool:
+                # If it's already bool, assume PyTorch semantics (True=ignore)
+                # So we invert it for SDPA (True=attend)
+                kp_mask = ~key_padding_mask.view(batch_size, 1, 1, seq_k)
+            else:
+                # If it's int/float (1/0), assume HF semantics (1=attend)
+                # So we just cast to bool (1->True->attend)
+                kp_mask = key_padding_mask.bool().view(batch_size, 1, 1, seq_k)
+            
+            if sdpa_mask is None:
+                sdpa_mask = kp_mask
+            else:
+                # Combine masks if both present (rare)
+                # Broadcast kp_mask to (batch, 1, 1, seq_k) and combine
+                sdpa_mask = sdpa_mask + kp_mask
+
+        # Check if we can use Flash Attention
+        use_flash = self._should_use_flash_attn(q, k, v)
+        
+        if use_flash:
+            # Note: SDPA with mask might drop to memory-efficient attention (which is fine)
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=sdpa_mask, is_causal=is_causal
+                )
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=sdpa_mask, is_causal=is_causal
+            )
+            
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_q, self.embed_dim)
+        out = self.out_proj(out)
+        out = self.dropout(out)
+        
+        if not self.batch_first:
+            out = out.transpose(0, 1)
+            
+        return out, None
+
+
 class TransformerDecoderLayer(Module):
     r"""TransformerDecoderLayer is made up of self-attn, multi-head-attn and feedforward network.
 
@@ -1866,20 +2175,22 @@ class TransformerDecoderLayer(Module):
             use_flash_attn=use_flash_attn,
             **factory_kwargs,
         )
-        self.multihead_attn = MultiheadAttention(
+        self.multihead_attn = MultiHeadCrossAttention(
             d_model,
             nhead,
             dropout=dropout,
             batch_first=batch_first,
             bias=bias,
+            use_flash_attn=use_flash_attn,
             **factory_kwargs,
         )
-        self.inst_multihead_attn = MultiheadAttention(
+        self.inst_multihead_attn = MultiHeadCrossAttention(
             d_model,
             nhead,
             dropout=dropout,
             batch_first=batch_first,
             bias=bias,
+            use_flash_attn=use_flash_attn,
             **factory_kwargs,
         )
         self.cross_attn_gating = SimpleTokenTypeGating(d_model, device=device)
@@ -1939,7 +2250,8 @@ class TransformerDecoderLayer(Module):
         inst_key_padding_mask: Optional[Tensor] = None,
         tgt_is_causal: bool = False,
         memory_is_causal: bool = False,
-    ) -> Tensor:
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         r"""Pass the inputs (and mask) through the decoder layer.
 
         Args:
@@ -1971,7 +2283,8 @@ class TransformerDecoderLayer(Module):
         x = tgt
         # print(f'target is causal: {tgt_is_causal}')
         if self.norm_first:
-            x = x + self._sa_block(self.norm1(x), tgt_is_causal)
+            sa_out, current_past_key_value = self._sa_block(self.norm1(x), tgt_is_causal, past_key_value)
+            x = x + sa_out
             text_attn_out = self._mha_block(
                 self.norm2(x),
                 memory,
@@ -1999,7 +2312,8 @@ class TransformerDecoderLayer(Module):
             else:
                 x = x + self._ff_block(self.norm4(x))
         else:
-            x = self.norm1(x + self._sa_block(x, tgt_is_causal))
+            sa_out, current_past_key_value = self._sa_block(x, tgt_is_causal, past_key_value)
+            x = self.norm1(x + sa_out)
             text_attn_out = self._mha_block(
                 x, memory, memory_mask, memory_key_padding_mask, memory_is_causal
             )
@@ -2024,14 +2338,14 @@ class TransformerDecoderLayer(Module):
                 x = self.norm4(x + self._ff_block(x))
 
         if self.use_moe:
-            return x, total_aux_loss, balance_loss, router_z_loss
+            return x, total_aux_loss, balance_loss, router_z_loss, current_past_key_value
         else:
-            return x
+            return x, current_past_key_value
 
     # self-attention block
-    def _sa_block(self, x: Tensor, is_causal: bool = False) -> Tensor:
-        x = self.self_attn(x, is_causal=is_causal)
-        return self.dropout1(x)
+    def _sa_block(self, x: Tensor, is_causal: bool = False, past_key_value: Optional[Tuple[Tensor, Tensor]] = None) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
+        x, current_past_key_value = self.self_attn(x, is_causal=is_causal, past_key_value=past_key_value)
+        return self.dropout1(x), current_past_key_value
 
     # multihead attention block
     def _mha_block(

@@ -4,48 +4,69 @@ model:
     decoder_num_layers: 12
     decoder_num_heads: 8
     decoder_d_model: 768
-    decoder_intermediate_size: 3072 # Increased from 1024 (usually 4x d_model)
-    use_moe: False
+    decoder_intermediate_size: 3072
     num_experts: 4
-    use_deepspeed: False
-    use_accelerate: True
+    # use_deepspeed: False # Unused in new trainer
+    # use_accelerate: True # Unused in new trainer (Accelerator is always used)
     use_instrument_conditioning: True # Set True for instrument-controlled phase
+    instrument_vocab_size: 23
+    no_instr_token_id: 22
+    dropout: 0.2 # Increased to 0.2 to stronger combat overfitting
     instrument_classes:
       [
+        "Drums",
         "Piano",
-        "Chromatic Percussion",
-        "Organ",
-        "Guitar",
-        "Bass",
-        "Strings",
-        "Ensemble",
+        "Mallets",
+        "Organs / Keyboards",
+        "Guitars",
+        "Basses",
+        "Solo Strings",
+        "String Articulations",
+        "Harp",
+        "Timpani",
+        "String Ensembles",
+        "Choirs / Voice Pads",
+        "Orchestra Hit",
         "Brass",
-        "Reed",
-        "Pipe / Winds",
-        "Synth Lead",
-        "Synth Pad",
-        "Synth Effects",
-        "Ethnic",
-        "Percussive",
+        "Saxophones",
+        "Double Reeds",
+        "Clarinets",
+        "Flutes & Pipes",
+        "Synth Leads",
+        "Synth Pads",
+        "Synth FX",
+        "World Instruments",
+        "Percussive Instruments",
         "Sound Effects",
-        "Drums / Percussion",
       ]
 
 training:
+    # Dataloader & Optimization defaults
+  num_workers: 16
+  shuffle: true
+  use_augmentation: true # Enable caption augmentation (dropout) and MIDI pitch shift (-5 to +6 semitones)
+  use_cache: true
+  prefetch_factor: 8
+  use_torch_compile: false # Disabled: incompatible with custom gating mechanism
+  use_fused_adamw: true
+  max_grad_norm: 1.0
   text2midi_model:
-    epochs: 100
-    batch_size: 48
-    learning_rate: 0.000001
-    weight_decay: 0.05
-    gradient_accumulation_steps: 3 # Reduced from 4 (effective batch: 48*3=144)
+    # epochs: 100 # fallback
+
+    # batch_size: 2 # Unused, shadowed by per_device_train_batch_size
+    learning_rate: 0.0001 # learning rate for pretraining
+    weight_decay: 0.1 # Increased to 0.1 for better regularization
+    per_device_train_batch_size: 24
+    gradient_accumulation_steps: 5
     validation_samples: null # Limit validation samples
+    # Progressive instrument dropout: start high, gradually reduce
+    # This forces the model to learn general patterns first, then specialize
     instrument_dropout_schedule:
-      - [0, 0.2]
-      - [30, 0.1]
+      - [0, 0.5]
     strategies:
       pretrain:
         epochs_no_inst: 0
-        epochs_inst: 100
+        epochs_inst: 40
       finetune:
         epochs_no_inst: 0
         epochs_inst: 30
@@ -53,31 +74,21 @@ training:
     checkpointing_steps: epoch
     report_to: tensorboard
     output_dir: ./checkpoints # Changed to relative path
-    per_device_train_batch_size: 48 # Increased from 32 to utilize A100 better
     use_scheduler: True
     lr_scheduler_type: cosine #choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
-    num_warmup_steps: 1000
-    min_lr_ratio: 0.01
-    save_every: 5
+    num_warmup_steps: 300
+    min_lr_ratio: 0.0001
+    save_every: 1
     max_train_steps: None
-    # Dataloader & Optimization defaults
-    num_workers: 4
-    shuffle: true
-    use_augmentation: false
-    use_cache: true
-    prefetch_factor: 2
-    use_torch_compile: false # Disabled: incompatible with custom gating mechanism
-    use_fused_adamw: true
-    max_grad_norm: 1.0
-    scheduled_sampling: False
-    epsilon: 0
-    c: -0.0161
-    k: -0.312
+    # scheduled_sampling: False # Unused
+    # epsilon: 0 # Unused
+    # c: -0.0161 # Unused
+    # k: -0.312 # Unused
     # Checkpoint strategy
     checkpoint_strategy:
       keep_best: true # Always keep best model
       keep_latest: true # Always keep latest checkpoint
-      keep_last_n: 5 # Keep last N periodic checkpoints
+      keep_last_n: 10 # Keep last N periodic checkpoints
       save_every: 1 # Save checkpoint every N epochs
       use_validation: true
       save_metadata: true # Save metadata with each checkpoint
@@ -105,8 +116,8 @@ raw_data:
       folder_path: ./data/midicaps # Changed to relative path
       file_extension: mid
 
-deepspeed_config:
-  deepspeed_config_path: ./configs/ds_config.json # Changed to relative path
+# deepspeed_config:
+#   deepspeed_config_path: ./configs/ds_config.json # Changed to relative path
 
 artifact_folder: ./artifacts
 tokenizer_file: vocab_remi_z.pkl # file name saved/loaded under artifact_folder
@@ -129,3 +140,24 @@ tokenizer:
   use_programs: true
   num_tempos: 32
   tempo_range: [40, 250]
+
+inference:
+  max_len: 2048
+  temperature: 0.8
+  multitrack_bias: 0
+  use_kv_cache: true
+  bar_bias: 0
+
+evaluation:
+  captions_file: captions/all_captions.json
+  output_dir: evaluation_mid_no_inst_cond_smoothing_pretrain_14_finetune_7_no_mask
+  remi_vocab: artifacts/vocab_remi_z.pkl
+  device: cuda
+  overwrite: false
+  limit: 120
+  split: test
+  seed: 42
+  batch_size: 24
+  disable_instrument_masking: True
+  disable_instrument_conditioning: True
+  disable_grammar_constraints: false

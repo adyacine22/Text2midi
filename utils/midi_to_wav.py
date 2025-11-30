@@ -63,9 +63,17 @@ def save_wav(midi_filepath, wav_filepath, soundfont_path=None):
             return None
 
     try:
+        env = os.environ.copy()
+        env["SDL_AUDIODRIVER"] = "dummy"
+        env["SDL_VIDEODRIVER"] = "dummy"
+        
         subprocess.run(
             [
                 "fluidsynth",
+                "-a",
+                "null",
+                "-o",
+                "synth.polyphony=1024",
                 "-r",
                 "48000",
                 soundfont_path,
@@ -80,6 +88,7 @@ def save_wav(midi_filepath, wav_filepath, soundfont_path=None):
                 wav_filepath,
             ],
             check=True,
+            env=env,
         )
     except subprocess.CalledProcessError as e:
         print(f"❌ Error converting {os.path.basename(midi_filepath)}: {e}")

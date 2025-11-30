@@ -10,6 +10,7 @@ This module provides:
 
 import os
 import sys
+import re
 import random
 import pickle
 from abc import ABC, abstractmethod
@@ -215,6 +216,19 @@ class TrainingMusicDataset(BaseMusicDataset):
             self.nlp.add_pipe("sentencizer")
         
         print(f"TrainingMusicDataset: {len(self.captions)} samples, augmentation={use_augmentation}, cache={use_cache}")
+        
+        # Pre-calculate pitch token mappings for augmentation
+        self.pitch_ids_map = {} # id -> pitch_value (0-127)
+        self.pitch_val_to_id = {} # pitch_value -> id
+        
+        if self.remi_tokenizer:
+            # We only care about melodic pitches p-0 to p-127
+            for i in range(128):
+                token = f"p-{i}"
+                if hasattr(self.remi_tokenizer, "token_to_id") and token in self.remi_tokenizer.token_to_id:
+                    tid = self.remi_tokenizer.token_to_id[token]
+                    self.pitch_ids_map[tid] = i
+                    self.pitch_val_to_id[i] = tid
     
     def __getitem__(self, idx: int) -> Optional[Dict]:
         """Get training item with MIDI tokens and caption."""
@@ -252,8 +266,17 @@ class TrainingMusicDataset(BaseMusicDataset):
         
         # 2. Process caption (with optional augmentation)
         caption = item["caption"]
-        if self.use_augmentation and random.random() > 0.5:
-            caption = self._augment_caption(caption)
+        if self.use_augmentation:
+            # Caption augmentation (dropout sentences)
+            if random.random() > 0.5:
+                caption = self._augment_caption(caption)
+            
+            # MIDI augmentation (pitch shift)
+            # Apply with 50% probability
+            if random.random() > 0.5:
+                tokenized_midi = self._augment_midi(tokenized_midi)
+                # If we shifted pitch, we MUST mask the key in the caption to avoid mismatch
+                caption = self._mask_key_info(caption)
         
         # 3. Extract instruments
         inst_ids = self._extract_instruments(item)
@@ -294,6 +317,39 @@ class TrainingMusicDataset(BaseMusicDataset):
         
         return " ".join([s.text for s in new_sentences])
 
+    
+    def _augment_midi(self, tokens: List[int]) -> List[int]:
+        """Augment MIDI tokens with pitch shift."""
+        # Shift range: -5 to +6 semitones
+        shift = random.randint(-5, 6)
+        if shift == 0:
+            return tokens
+            
+        new_tokens = []
+        for tid in tokens:
+            if tid in self.pitch_ids_map:
+                old_pitch = self.pitch_ids_map[tid]
+                new_pitch = old_pitch + shift
+                # Clamp to valid range [0, 127]
+                new_pitch = max(0, min(127, new_pitch))
+                if new_pitch in self.pitch_val_to_id:
+                    new_tokens.append(self.pitch_val_to_id[new_pitch])
+                else:
+                    # Should not happen if map is complete, but fallback to original
+                    new_tokens.append(tid)
+            else:
+                new_tokens.append(tid)
+        
+        return new_tokens
+    
+    def _mask_key_info(self, caption: str) -> str:
+        """Mask key information in caption to prevent mismatch with pitch-shifted MIDI."""
+        # Regex to find key declarations
+        # Matches: "in X major", "key of X minor", "centered in X major", etc.
+        key_pattern = r"(?i)\b(in|key of|centered in|composed in|written in|framed in|set in)\s+([A-G][#b]?)\s+(major|minor)"
+        
+        # Remove entirely (replace with empty string)
+        return re.sub(key_pattern, "", caption)
 
 class InferenceMusicDataset(BaseMusicDataset):
     """Dataset for inference - returns metadata only, no MIDI loading."""
@@ -513,5 +569,7 @@ def create_dataloader(
         num_workers=num_workers,
         collate_fn=collator,
         drop_last=(mode == "train"),
-        prefetch_factor=kwargs.get("prefetch_factor", 2) if num_workers > 0 else None
+        pin_memory=True,
+        prefetch_factor=kwargs.get("prefetch_factor", 2) if num_workers > 0 else None,
+        persistent_workers=True if num_workers > 0 else False
     )

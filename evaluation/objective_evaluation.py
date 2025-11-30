@@ -9,13 +9,12 @@ generated MIDI files. The script:
 * Measures compression ratio, CLAP similarity, tempo bin, tempo bin (±1 bin),
   key accuracy, key accuracy with relative-major/minor tolerance
 * Adds an instrument-control metric that compares predicted instrument
-  families with the reference instrument classes stored in MidiCaps
+  programs with the reference instrument programs stored in the ground truth MIDI.
 
 Example usage:
 python evaluation/objective_evaluation.py \
-    --predictions_dir output/generated_midis \
-    --captions captions/all_captions.json \
-    --split test \
+    --generated_json output/generated_samples.jsonl \
+    --ground_truth_root data/midicaps \
     --report_file artifacts/text2midi_objective_eval.json
 """
 
@@ -28,11 +27,15 @@ import os
 import shutil
 import sys
 import tempfile
+import warnings
+
+# Suppress pretty_midi warnings about tempo/key change events on non-zero tracks
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="pretty_midi")
 import zlib
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -83,6 +86,7 @@ class MidiFeatures:
     key_readable: Optional[str]
     key_tuple: Optional[Tuple[int, str]]
     instrument_classes: Set[str]
+    instrument_programs: Set[int]
 
 
 def tempo_to_bin(tempo_bpm: Optional[float]) -> Optional[int]:
@@ -148,6 +152,16 @@ def _instrument_classes_from_midi(pm: pretty_midi.PrettyMIDI) -> Set[str]:
     return classes
 
 
+def _instrument_programs_from_midi(pm: pretty_midi.PrettyMIDI) -> Set[int]:
+    programs: Set[int] = set()
+    for instrument in pm.instruments:
+        if instrument.is_drum:
+            programs.add(-1)
+        else:
+            programs.add(instrument.program)
+    return programs
+
+
 def _compression_ratio_from_midi(pm: pretty_midi.PrettyMIDI) -> float:
     """Estimate compression ratio by zlib compressing note tuples."""
     signatures: List[str] = []
@@ -186,6 +200,7 @@ def extract_midi_features(midi_path: str) -> Optional[MidiFeatures]:
         key_readable=key_readable,
         key_tuple=key_tuple or detect_key_label(key_readable),
         instrument_classes=_instrument_classes_from_midi(pm),
+        instrument_programs=_instrument_programs_from_midi(pm),
     )
     return features
 
@@ -247,55 +262,115 @@ class ClapScorer:
             return wav_path
         return None
 
-    def score(self, midi_path: str, caption: str, tag: str) -> Optional[float]:
+    def score(self, midi_path: str, caption: str, tag: str = "pred") -> float:
         if not self.enabled or not self._model:
-            return None
+            return 0.0
+        
         wav_path = self._render_wav(midi_path, tag)
-        if wav_path is None:
-            return None
-        audio_embedding = self._model.get_audio_embedding_from_filelist([str(wav_path)])
-        text_embedding = self._model.get_text_embedding([caption])
-        return cosine_similarity(audio_embedding[0], text_embedding[0])
+        if not wav_path:
+            return 0.0
+
+        try:
+            audio_embed = self._model.get_audio_embedding_from_filelist(
+                x=[str(wav_path)], use_tensor=False
+            )
+            text_embed = self._model.get_text_embedding([caption], use_tensor=False)
+            return cosine_similarity(audio_embed[0], text_embed[0])
+        except Exception as exc:
+            LOGGER.warning("CLAP scoring failed for %s: %s", midi_path, exc)
+            return 0.0
 
 
 class MetricTracker:
-    """Utility to accumulate scalar metrics and accuracies."""
+    """Accumulate metrics and compute averages."""
 
-    def __init__(self) -> None:
+    def __init__(self):
         self.scalars: Dict[str, List[float]] = defaultdict(list)
         self.accuracies: Dict[str, List[int]] = defaultdict(list)
-        self.instrument_precision: List[float] = []
-        self.instrument_recall: List[float] = []
-        self.instrument_f1: List[float] = []
+        self.instrument_scores: List[Tuple[float, float, float]] = []
 
-    def add_scalar(self, name: str, value: Optional[float]) -> None:
+    def add_scalar(self, name: str, value: Optional[float]):
         if value is not None and np.isfinite(value):
             self.scalars[name].append(float(value))
 
-    def add_accuracy(self, name: str, hit: Optional[bool]) -> None:
-        if hit is not None:
-            self.accuracies[name].append(int(bool(hit)))
+    def add_accuracy(self, name: str, is_correct: Optional[bool]):
+        if is_correct is not None:
+            self.accuracies[name].append(int(is_correct))
 
-    def add_instrument_scores(self, precision: float, recall: float, f1_score: float) -> None:
-        self.instrument_precision.append(precision)
-        self.instrument_recall.append(recall)
-        self.instrument_f1.append(f1_score)
+    def add_instrument_scores(self, p: float, r: float, f: float):
+        self.instrument_scores.append((p, r, f))
 
     def summarize(self) -> Dict[str, float]:
-        summary: Dict[str, float] = {}
+        summary = {}
         for name, values in self.scalars.items():
-            if values:
-                summary[name] = float(np.mean(values))
-        for name, hits in self.accuracies.items():
-            if hits:
-                summary[name] = float(np.mean(hits))
-        if self.instrument_precision:
-            summary["instrument_precision"] = float(np.mean(self.instrument_precision))
-        if self.instrument_recall:
-            summary["instrument_recall"] = float(np.mean(self.instrument_recall))
-        if self.instrument_f1:
-            summary["instrument_f1"] = float(np.mean(self.instrument_f1))
+            summary[name] = float(np.mean(values)) if values else 0.0
+        for name, values in self.accuracies.items():
+            summary[name] = float(np.mean(values)) if values else 0.0
+
+        if self.instrument_scores:
+            p_vals, r_vals, f_vals = zip(*self.instrument_scores)
+            summary["instrument_precision"] = float(np.mean(p_vals))
+            summary["instrument_recall"] = float(np.mean(r_vals))
+            summary["instrument_f1"] = float(np.mean(f_vals))
+        else:
+            summary["instrument_precision"] = 0.0
+            summary["instrument_recall"] = 0.0
+            summary["instrument_f1"] = 0.0
+
         return summary
+
+
+def _keys_match(
+    pred_key: Optional[Tuple[int, str]], gt_key: Optional[Tuple[int, str]]
+) -> Tuple[Optional[bool], Optional[bool]]:
+    """
+    Compare two keys. Returns (exact_match, relative_match).
+    relative_match is True if keys are same, or relative major/minor.
+    """
+    if pred_key is None or gt_key is None:
+        return None, None
+
+    pred_pc, pred_mode = pred_key
+    gt_pc, gt_mode = gt_key
+
+    exact = (pred_pc == gt_pc) and (pred_mode == gt_mode)
+
+    # Relative major/minor check
+    # Major to relative minor: down 3 semitones (or up 9)
+    # Minor to relative major: up 3 semitones
+    rel = exact
+    if not rel:
+        if pred_mode == "major" and gt_mode == "minor":
+            rel = (pred_pc - 3) % 12 == gt_pc
+        elif pred_mode == "minor" and gt_mode == "major":
+            rel = (pred_pc + 3) % 12 == gt_pc
+
+    return exact, rel
+
+
+def _instrument_scores(
+    pred_items: Set[Any], gt_items: Sequence[Any]
+) -> Tuple[float, float, float]:
+    """Compute precision, recall, f1 for instrument items (classes or programs)."""
+    gt_set = set(gt_items)
+    if not gt_set:
+        # If ground truth has no instruments, but we predicted some -> precision 0
+        # If we predicted none -> precision 1 (technically correct)
+        # But usually we expect some instruments.
+        # Let's handle edge case:
+        if not pred_items:
+            return 1.0, 1.0, 1.0
+        return 0.0, 0.0, 0.0
+
+    tp = len(pred_items.intersection(gt_set))
+    fp = len(pred_items - gt_set)
+    fn = len(gt_set - pred_items)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    return precision, recall, f1
 
 
 def _resolve_prediction_path(predictions_dir: Path, location: str) -> Optional[Path]:
@@ -309,7 +384,24 @@ def _resolve_prediction_path(predictions_dir: Path, location: str) -> Optional[P
 
 
 def _resolve_ground_truth_path(ground_truth_root: Path, location: str) -> Path:
-    return ground_truth_root / location
+    # Try direct path first
+    path = ground_truth_root / location
+    if path.exists():
+        return path
+        
+    # Try common data subdirectories
+    candidates = [
+        ground_truth_root / "data" / "symphonynet" / location,
+        ground_truth_root / "data" / "midicaps" / location,
+        ground_truth_root / "data" / location,
+    ]
+    
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+            
+    # Return the direct path as fallback (will be reported as missing)
+    return path
 
 
 def _load_metadata_from_json(json_path: Path) -> List[Dict]:
@@ -353,9 +445,16 @@ def evaluate(
                 missing_predictions += 1
                 continue
             
-            # Resolve path relative to the JSON file's directory (which is the output_dir)
-            # This assumes the JSON is at the root of the output directory
-            pred_path = generated_json.parent / pred_path_str
+            # Try resolving path directly (relative to CWD)
+            pred_path = Path(pred_path_str)
+            
+            # If not found, try resolving relative to the JSON file
+            if not pred_path.exists():
+                 pred_path = generated_json.parent / pred_path_str
+                 
+            # If still not found, try resolving relative to JSON file but only using the filename
+            if not pred_path.exists():
+                 pred_path = generated_json.parent / Path(pred_path_str).name
             
             if not pred_path.exists():
                 LOGGER.warning("Predicted file missing: %s", pred_path)
@@ -395,8 +494,9 @@ def evaluate(
             clap_score = clap_scorer.score(str(pred_path), caption, tag="pred")
             tracker.add_scalar("clap_score", clap_score)
 
+            # Use Program IDs for instrument evaluation instead of classes
             precision, recall, f1_score = _instrument_scores(
-                pred_features.instrument_classes, entry.get("instrument_classes", [])
+                pred_features.instrument_programs, gt_features.instrument_programs
             )
             tracker.add_instrument_scores(precision, recall, f1_score)
 
@@ -421,7 +521,7 @@ def evaluate(
                     "instrument_precision": precision,
                     "instrument_recall": recall,
                     "instrument_f1": f1_score,
-                }
+                },
             )
 
             processed += 1

@@ -24,17 +24,32 @@ import pretty_midi
 
 
 def parse_args():
+    # Load config first to get defaults
+    import yaml
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs", "config.yaml")
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    
+    eval_config = config.get("evaluation", {})
+    
     parser = argparse.ArgumentParser()
-    parser.add_argument("--captions-file", type=str, required=True)
+    parser.add_argument("--captions-file", type=str, default=eval_config.get("captions_file", "captions/all_captions.json"))
     parser.add_argument("--ckpt-path", type=str, required=True)
-    parser.add_argument("--output-dir", type=str, required=True)
-    parser.add_argument("--remi-vocab", type=str, default="artifacts/vocab_remi_z.pkl")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--split", type=str, default="test")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--output-dir", type=str, default=eval_config.get("output_dir", "evaluation_midi_json"))
+    parser.add_argument("--remi-vocab", type=str, default=eval_config.get("remi_vocab", "artifacts/vocab_remi_z.pkl"))
+    parser.add_argument("--device", type=str, default=eval_config.get("device", "cuda"))
+    parser.add_argument("--overwrite", action="store_true", default=eval_config.get("overwrite", False))
+    parser.add_argument("--limit", type=int, default=eval_config.get("limit", None))
+    parser.add_argument("--split", type=str, default=eval_config.get("split", "test"))
+    parser.add_argument("--seed", type=int, default=eval_config.get("seed", 42))
+    parser.add_argument("--batch-size", type=int, default=eval_config.get("batch_size", 32))
+    # New flags
+    parser.add_argument("--disable-instrument-masking", action="store_true", default=eval_config.get("disable_instrument_masking", False),
+                        help="If set, the model will not restrict output logits to the specified instruments.")
+    parser.add_argument("--disable-instrument-conditioning", action="store_true", default=eval_config.get("disable_instrument_conditioning", False),
+                        help="If set, the model will receive padding tokens instead of instrument IDs for conditioning.")
+    parser.add_argument("--disable-grammar-constraints", action="store_true", default=eval_config.get("disable_grammar_constraints", False),
+                        help="If set, the model will not apply REMI‑z structural masking during generation.")
     return parser.parse_args()
 
 
@@ -57,10 +72,9 @@ class CaptionDataset(Dataset):
         return self.captions[idx]
 
 
-def collate_fn_dynamic_instruments(batch, text_tokenizer, instrument_class_to_id, inst_pad_id):
+def collate_fn_dynamic_instruments(batch, text_tokenizer, instrument_class_to_id, inst_pad_id, disable_instrument_masking=False, disable_instrument_conditioning=False):
     """
-    Collates batch data, creating dynamic instrument conditioning tensors
-    based on 'instrument_classes' present in each data item.
+    Collates batch data, creating dynamic instrument conditioning tensors.
     """
     # Standard collation for text and IDs
     captions = [item["caption"] for item in batch]
@@ -72,11 +86,39 @@ def collate_fn_dynamic_instruments(batch, text_tokenizer, instrument_class_to_id
     max_inst_len = 0
 
     for item in batch:
-        inst_ids_for_item = set()
-        if "instrument_classes" in item:
-            for inst_class in item["instrument_classes"]:
-                if inst_class in instrument_class_to_id:
-                    inst_ids_for_item.add(instrument_class_to_id[inst_class])
+        if disable_instrument_conditioning:
+            # If conditioning is disabled, we pass empty list which results in padding
+            inst_ids_for_item = [inst_pad_id]
+        elif disable_instrument_masking:
+            # If masking is disabled but conditioning is enabled, we still want to pass the instruments
+            # BUT the user might want to condition on instruments but NOT mask the output?
+            # Wait, if masking is disabled, we still want to condition on the instruments provided in the caption.
+            # The previous logic for disable_instrument_masking was: "Use a single default instrument".
+            # That effectively disabled conditioning AND masking.
+            # Now we have separate flags.
+            
+            # Case 1: Conditioning=True, Masking=True (Default) -> Pass IDs, use them for mask.
+            # Case 2: Conditioning=True, Masking=False -> Pass IDs, don't use them for mask.
+            # Case 3: Conditioning=False, Masking=False -> Pass Pad ID, don't use for mask.
+            # Case 4: Conditioning=False, Masking=True -> Pass Pad ID, use for mask (will mask everything? or nothing?)
+            
+            # So here we just need to extract the IDs if conditioning is enabled.
+            inst_ids_for_item = set()
+            if "instrument_classes" in item:
+                for inst_class in item["instrument_classes"]:
+                    if inst_class in instrument_class_to_id:
+                        inst_ids_for_item.add(instrument_class_to_id[inst_class])
+            if not inst_ids_for_item:
+                 inst_ids_for_item = {inst_pad_id}
+        else:
+            # Standard case
+            inst_ids_for_item = set()
+            if "instrument_classes" in item:
+                for inst_class in item["instrument_classes"]:
+                    if inst_class in instrument_class_to_id:
+                        inst_ids_for_item.add(instrument_class_to_id[inst_class])
+            if not inst_ids_for_item:
+                 inst_ids_for_item = {inst_pad_id}
         
         inst_list = sorted(list(inst_ids_for_item))
         batch_inst_ids.append(inst_list)
@@ -125,8 +167,11 @@ def main():
     # --- Instrument Class Mapping ---
     instrument_class_names = list(INSTRUMENT_CLASSES.keys())
     instrument_class_to_id = {name: i for i, name in enumerate(instrument_class_names)}
-    # The padding token ID should be the vocabulary size of the instrument encoder
-    instrument_pad_id = 17 
+    
+    # Dynamically determine vocab size from mapping (should be 24)
+    instrument_vocab_size = len(instrument_class_names)
+    # The padding token ID should be the vocabulary size (next available ID)
+    instrument_pad_id = instrument_vocab_size
 
     # Model instantiation - MUST match the architecture used during training
     model = Transformer(
@@ -137,7 +182,7 @@ def main():
         dim_feedforward=3072,   # Changed from 1024 to 3072
         max_len=2048,
         use_instrument_conditioning=True,
-        instrument_vocab_size=17,
+        instrument_vocab_size=instrument_vocab_size,
         no_instr_token_id=instrument_pad_id,
         tokenizer=remi_tokenizer,
     )
@@ -159,14 +204,33 @@ def main():
     # Create dataset and dataloader
     dataset = CaptionDataset(args.captions_file, split=args.split, limit=args.limit)
     
-    # Use partial to pass necessary maps and IDs to the collate function
-    collate_fn = partial(collate_fn_dynamic_instruments, 
-                         text_tokenizer=text_tokenizer, 
-                         instrument_class_to_id=instrument_class_to_id,
-                         inst_pad_id=instrument_pad_id)
+    # Use partial to pass necessary maps and IDs to the collate function, including the new flag
+    collate_fn = partial(
+        collate_fn_dynamic_instruments,
+        text_tokenizer=text_tokenizer,
+        instrument_class_to_id=instrument_class_to_id,
+        inst_pad_id=instrument_pad_id,
+        disable_instrument_masking=args.disable_instrument_masking,
+        disable_instrument_conditioning=args.disable_instrument_conditioning,
+    )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate_fn)
 
+    # Load config
+    import yaml
+    config_path = os.path.join(project_root, "configs", "config.yaml")
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    
+    inference_config = config.get("inference", {})
+    max_len = inference_config.get("max_len", 1024)
+    temperature = inference_config.get("temperature", 0.7)
+    multitrack_bias = inference_config.get("multitrack_bias", 0.0)
+    bar_bias = inference_config.get("bar_bias", 0.0)
+    use_kv_cache = inference_config.get("use_kv_cache", True)
+
     print(f"Generating from {len(dataset)} captions in split '{args.split}'...")
+    print(f"Inference params: max_len={max_len}, temp={temperature}, multitrack_bias={multitrack_bias}, bar_bias={bar_bias}, kv_cache={use_kv_cache}")
+
     for batch_idx, batch in enumerate(tqdm.tqdm(dataloader)):
         input_ids = batch["input_ids"].to(args.device)
         attention_mask = batch["attention_mask"].to(args.device)
@@ -177,10 +241,15 @@ def main():
             generated_ids = model.generate(
                 src=input_ids,
                 src_mask=attention_mask,
-                max_len=1024,
-                temperature=0.7,
+                max_len=max_len,
+                temperature=temperature,
                 inst=inst_ids,
                 inst_mask=inst_mask,
+                multitrack_bias=multitrack_bias,
+                bar_bias=bar_bias,
+                disable_grammar_constraints=args.disable_grammar_constraints,
+                disable_instrument_masking=args.disable_instrument_masking,
+                use_kv_cache=use_kv_cache,
             )
         
 

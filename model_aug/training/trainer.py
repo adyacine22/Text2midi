@@ -93,7 +93,7 @@ class Trainer:
         self._setup_checkpoint_manager()
         
         # 10. Setup criterion
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=0.01)
         
         # 11. Resume from checkpoint if specified
         if self.args.resume:
@@ -101,6 +101,10 @@ class Trainer:
         
         # 12. Log training info
         self._log_training_info()
+
+        # Enable TF32 for speedup on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     
     def _setup_accelerator(self):
         """Setup Accelerate accelerator."""
@@ -236,12 +240,14 @@ class Trainer:
             use_moe=self.config.get("model.text2midi_model.use_moe", False),
             num_experts=self.config.get("model.text2midi_model.num_experts", 4),
             device="cpu",  # Will be moved by accelerator
-            instrument_vocab_size=instrument_vocab_size or 129,
+            instrument_vocab_size=instrument_vocab_size or 23,
             use_instrument_conditioning=self.config.use_instrument_conditioning,
-            no_instr_token_id=instrument_vocab_size if instrument_vocab_size else 129,
+            no_instr_token_id=instrument_vocab_size if instrument_vocab_size else 22,
+            dropout=self.config.get("model.text2midi_model.dropout", 0.1),
             tokenizer=self.tokenizer,
         )
         
+        # Optional: torch.compile
         # Optional: torch.compile
         if self.config.get("training.text2midi_model.use_torch_compile", False):
             try:
@@ -479,7 +485,9 @@ class Trainer:
                     # Wait, user said: "dropout_p = 0.8 (model mostly ignores instruments)"
                     # So we want to DROP with prob 0.8.
                     # keep = rand > dropout_p
-                    keep = torch.rand(inst_mask.shape[0], 1, device=inst_mask.device) > current_dropout_p
+                    # CHANGED: Use per-instrument dropout instead of per-sample all-or-nothing dropout.
+                    # This allows the model to learn from partial conditioning (e.g. "given drums, generate the rest").
+                    keep = torch.rand(inst_mask.shape, device=inst_mask.device) > current_dropout_p
                     
                     # If we don't keep, we replace with no_instr_token_id
                     if not keep.all():
@@ -495,20 +503,26 @@ class Trainer:
                 tgt_input = tgt[:, :-1]
                 tgt_output = tgt[:, 1:]
                 
-                model_output = self.model(
-                    encoder_input, attention_mask, tgt_input,
-                    inst=inst_ids, inst_mask=inst_mask
-                )
-                
-                if isinstance(model_output, tuple):
-                    outputs, aux_loss = model_output
-                else:
-                    outputs = model_output
-                    aux_loss = 0
-                
-                loss = self.criterion(outputs.view(-1, outputs.size(-1)), tgt_output.reshape(-1))
-                if isinstance(aux_loss, torch.Tensor):
-                    loss += aux_loss
+                # Forward pass with autocast
+                with self.accelerator.autocast():
+                    outputs = self.model(
+                        encoder_input, attention_mask, tgt_input,
+                        inst=inst_ids, inst_mask=inst_mask
+                    )
+                    
+                    if isinstance(outputs, tuple):
+                        outputs = outputs[0]
+                    
+                    # Calculate loss
+                    loss = self.criterion(outputs.view(-1, outputs.size(-1)), tgt_output.reshape(-1))
+                    
+                    # Auxiliary loss (e.g. load balancing for MoE)
+                    if hasattr(self.model, "module") and hasattr(self.model.module, "get_aux_loss"):
+                        aux_loss = self.model.module.get_aux_loss()
+                        loss += aux_loss
+                    elif hasattr(self.model, "get_aux_loss"):
+                        aux_loss = self.model.get_aux_loss()
+                        loss += aux_loss
                 
                 total_loss += loss.detach().float()
                 self.accelerator.backward(loss)
@@ -529,31 +543,18 @@ class Trainer:
                 
                 if self.accelerator.is_main_process and self.tb_writer:
                     # Basic loss
-                    self.tb_writer.add_scalar("train/loss_step", loss.item(), completed_steps)
+                    self.tb_writer.add_scalar("train/loss", loss.item(), completed_steps)
                     
                     # Learning rate
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    self.tb_writer.add_scalar("train/learning_rate", current_lr, completed_steps)
-                    
-                    # Perplexity (exp(loss))
-                    perplexity = torch.exp(loss).item()
-                    self.tb_writer.add_scalar("train/perplexity", perplexity, completed_steps)
-                    
-                    # Gradient norms
-                    total_norm = 0.0
-                    for p in self.model.parameters():
-                        if p.grad is not None:
-                            param_norm = p.grad.data.norm(2)
-                            total_norm += param_norm.item() ** 2
-                    total_norm = total_norm ** 0.5
-                    self.tb_writer.add_scalar("train/grad_norm", total_norm, completed_steps)
+                    self.tb_writer.add_scalar("train/lr", current_lr, completed_steps)
                     
                     # Token accuracy (top-1)
                     with torch.no_grad():
                         predictions = outputs.argmax(dim=-1)
                         correct = (predictions == tgt_output).float()
                         accuracy = correct.mean().item()
-                        self.tb_writer.add_scalar("train/token_accuracy", accuracy, completed_steps)
+                        self.tb_writer.add_scalar("train/accuracy", accuracy, completed_steps)
                     
                     # Instrument dropout probability
                     self.tb_writer.add_scalar("train/instrument_dropout", current_dropout_p, completed_steps)
@@ -668,14 +669,9 @@ class Trainer:
         self.accelerator.print(result_string)
         
         if self.tb_writer:
-            self.tb_writer.add_scalar("epoch/train_loss", epoch_loss, epoch)
-            self.tb_writer.add_scalar("epoch/learning_rate", current_lr, epoch)
-            self.tb_writer.add_scalar("epoch/perplexity", np.exp(epoch_loss), epoch)
-            
             if val_metrics:
-                self.tb_writer.add_scalar("epoch/val_loss", val_metrics['loss'], epoch)
-                self.tb_writer.add_scalar("epoch/val_accuracy", val_metrics['accuracy'], epoch)
-                self.tb_writer.add_scalar("epoch/val_perplexity", np.exp(val_metrics['loss']), epoch)
+                self.tb_writer.add_scalar("val/loss", val_metrics['loss'], epoch)
+                self.tb_writer.add_scalar("val/accuracy", val_metrics['accuracy'], epoch)
         
         with open(f"{self.config.output_dir}/summary.jsonl", "a") as f:
             f.write(json.dumps(result) + "\n\n")

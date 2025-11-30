@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 from miditok import TokenizerConfig
-from symusic import Note, Score, TimeSignature, Track
+from symusic import Note, Score, TimeSignature, Track, Tempo
 
 
 class TokenizedSequence:
@@ -91,8 +91,13 @@ class RemiZTokenizer:
         vocab.append("b-1")
 
         if self.include_time_signature:
-            vocab.extend([f"s-{i}" for i in range(len(self.config.time_signatures))])
+            # Define a reasonable number of time signature tokens
+            # Common time signatures: 2/4, 3/4, 4/4, 5/4, 6/8, 7/8, 9/8, 12/8, etc.
+            # We'll use 32 slots to cover common variations
+            num_time_sigs = 32
+            vocab.extend([f"s-{i}" for i in range(num_time_sigs)])
         if self.include_tempo:
+            # Use the num_tempos from config (typically 32 or 49)
             vocab.extend([f"t-{i}" for i in range(self.config.num_tempos)])
 
         token_to_id = {tok: i for i, tok in enumerate(vocab)}
@@ -200,6 +205,10 @@ class RemiZTokenizer:
         bar_ticks = score.ticks_per_quarter * 4  # Assuming 4/4 time signature
         step_ticks = score.ticks_per_quarter / 12.0  # 48th-note grid
 
+        # State tracking
+        current_tick = 0
+        current_bar_ticks = bar_ticks # Default 4/4
+        
         # State buffer for note attributes
         current_note = {"pitch": None, "duration": None, "onset": None}
 
@@ -214,7 +223,9 @@ class RemiZTokenizer:
                 pitch_val = current_note["pitch"]
                 dur_val = current_note["duration"]
 
-                start_tick = current_bar * bar_ticks + (onset_val * step_ticks)
+                # Calculate start tick based on current bar start + onset
+                # Note: onset_val is quantized step index.
+                start_tick = current_tick + (onset_val * step_ticks)
                 duration_ticks = dur_val * step_ticks
 
                 is_drum_note = current_instrument_program == 128
@@ -296,8 +307,78 @@ class RemiZTokenizer:
             elif token.startswith("b-"):
                 flush_note()  # Flush any pending note
                 current_bar += 1
+                current_tick += current_bar_ticks # Advance time by current bar length
                 # Do NOT reset instrument program here, persist it across bars
                 # unless explicit i-x token changes it.
+                i += 1
+
+            elif token.startswith("s-"):
+                # Time Signature
+                try:
+                    ts_id = int(token.split("-")[1])
+                    # Reverse mapping from _time_sig_token
+                    # This is a bit tricky as the mapping is many-to-one in the "uncommon" case.
+                    # But for common ones we can map back.
+                    # For now, let's just support the common ones we defined.
+                    
+                    # Reconstruct the map
+                    common_time_sigs_inv = {
+                        0: (4, 4), 1: (3, 4), 2: (2, 4), 3: (6, 8), 4: (5, 4),
+                        5: (7, 8), 6: (9, 8), 7: (12, 8), 8: (2, 2), 9: (3, 8), 10: (6, 4)
+                    }
+                    
+                    if ts_id in common_time_sigs_inv:
+                        num, den = common_time_sigs_inv[ts_id]
+                        # Calculate time in ticks
+                        # We need to know the current bar start time.
+                        # But wait, bar_ticks is currently fixed to 4/4!
+                        # If we change time signature, bar_ticks changes for FUTURE bars.
+                        # But the current bar's start time depends on PAST bars' lengths.
+                        
+                        # This simple decoder assumes fixed bar length (line 205: bar_ticks = score.ticks_per_quarter * 4).
+                        # To support variable time signatures, we need to track absolute time properly.
+                        
+                        # Let's update the TimeSignature in the score
+                        # We'll place it at the start of the current bar.
+                        # Note: This simple implementation might not handle complex mixed meter perfectly
+                        # if we don't track the accumulated ticks from previous bars correctly.
+                        
+                        # For now, let's just add the event.
+                        # Correct logic requires tracking `current_tick` instead of `current_bar * fixed_bar_ticks`.
+                        
+                        # Update current_bar_ticks for FUTURE bars (starting from the *next* b-1 token)
+                        # Wait, if s-X is at the start of the CURRENT bar, it affects the CURRENT bar's length.
+                        # Yes, s-X appears at the start of the bar.
+                        # So we should update current_bar_ticks immediately.
+                        
+                        current_bar_ticks = score.ticks_per_quarter * (num * 4 / den)
+                        
+                        # Add TimeSignature event to score
+                        score.time_signatures.append(TimeSignature(int(current_tick), num, den))
+                    
+                except (ValueError, IndexError):
+                    pass
+                i += 1
+
+            elif token.startswith("t-"):
+                # Tempo
+                try:
+                    tempo_id = int(token.split("-")[1])
+                    # Reverse mapping from _tempo_token
+                    tempo_bins = np.linspace(
+                        self.config.tempo_range[0],
+                        self.config.tempo_range[1],
+                        num=self.config.num_tempos, # Use config value
+                        endpoint=True,
+                    )
+                    if 0 <= tempo_id < len(tempo_bins):
+                        qpm = float(tempo_bins[tempo_id])
+                        # Add Tempo event to score
+                        from symusic import Tempo # Ensure imported if not top-level, but it is.
+                        score.tempos.append(Tempo(int(current_tick), qpm))
+                        
+                except (ValueError, IndexError):
+                    pass
                 i += 1
 
             else:
@@ -330,8 +411,29 @@ class RemiZTokenizer:
 
     def _time_sig_token(self, score: Score, bar_ticks: float) -> str:
         ts = score.time_signatures[0]
-        # Simple hash of numerator/denominator into 0-253 space
-        ts_id = min(253, ts.numerator * 16 + ts.denominator)
+        
+        # Map common time signatures to specific IDs (0-31)
+        common_time_sigs = {
+            (4, 4): 0,   # Most common
+            (3, 4): 1,   # Waltz
+            (2, 4): 2,   # March
+            (6, 8): 3,   # Compound duple
+            (5, 4): 4,   # Take Five
+            (7, 8): 5,   # Irregular
+            (9, 8): 6,   # Compound triple
+            (12, 8): 7,  # Compound quadruple
+            (2, 2): 8,   # Cut time
+            (3, 8): 9,   # Simple triple
+            (6, 4): 10,  # Compound duple (alternative)
+        }
+        
+        key = (ts.numerator, ts.denominator)
+        if key in common_time_sigs:
+            ts_id = common_time_sigs[key]
+        else:
+            # Hash uncommon time signatures to remaining slots (11-31)
+            ts_id = 11 + ((ts.numerator * 16 + ts.denominator) % 21)
+        
         return f"s-{ts_id}"
 
     def _tempo_token(self, score: Score) -> str:
