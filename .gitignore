@@ -170,7 +170,8 @@ cython_debug/
 output/
 checkpoint*/
 captions/
-evaluation_midi_json/
+evaluation_midi*/
+
 
 
 
